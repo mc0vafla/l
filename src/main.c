@@ -16,7 +16,6 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <wayland-client.h>
-
 #include <wayland-cursor.h>
 #include <xkbcommon/xkbcommon.h>
 #include <cairo/cairo.h>
@@ -27,19 +26,19 @@
 #include "xdg-shell-client-protocol.h"
 #include "../lib/jsmn.h"
 
-#define DEFAULT_FONT_NAME "DepartureMono"
-#define DEFAULT_FONT_SIZE 12
-#define DEFAULT_WIDTH     800
-#define DEFAULT_HEIGHT    600
+#define DEFAULT_FONT_NAME    "DepartureMono"
+#define DEFAULT_FONT_SIZE    12
+#define DEFAULT_WIDTH        800
+#define DEFAULT_HEIGHT       600
 
-#define MAX_CUSTOM_BINDS    64
+#define MAX_CUSTOM_BINDS     64
 #define MAX_ACTIONS_PER_BIND 16
 
-#define MIN_VTERM_COLS 80
-#define MIN_VTERM_ROWS 24
+#define MIN_VTERM_COLS       80
+#define MIN_VTERM_ROWS       24
 
-#define SCROLLBACK_SIZE  1000
-#define SCROLLBAR_WIDTH  6
+#define SCROLLBACK_SIZE      1000
+#define SCROLLBAR_WIDTH      6
 
 typedef struct {
     xkb_keysym_t sym;
@@ -345,6 +344,24 @@ static void strip_json_comments(char *buf) {
     }
 }
 
+static void clear_full_history(void) {
+    for (int i = 0; i < SCROLLBACK_SIZE; i++) {
+        if (app.scrollback[i]) {
+            free(app.scrollback[i]);
+            app.scrollback[i] = NULL;
+        }
+    }
+    app.scrollback_head = 0;
+    app.scrollback_count = 0;
+    app.scrollback_offset = 0;
+    app.selecting = 0;
+    app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
+    if (app.vtscreen) {
+        vterm_screen_reset(app.vtscreen, 1);
+    }
+    app.needs_render = 1;
+}
+
 static void load_config(void) {
     char path[1024];
     const char *home = getenv("HOME");
@@ -378,6 +395,7 @@ static void load_config(void) {
             fprintf(df, "  \"padding_x\": 6,\n");
             fprintf(df, "  \"padding_y\": 6,\n");
             fprintf(df, "  \"shell\": \"fish\",\n");
+            fprintf(df, "  // Available special escape sequences in actions: \\n or \\r (Enter), \\t (Tab), \\b (Backspace), \\e (Escape)\n");
             fprintf(df, "  \"binds\": [\n");
             fprintf(df, "    { \"key\": \"c\", \"mods\": \"ctrl+shift\", \"action\": \"copy\" },\n");
             fprintf(df, "    { \"key\": \"v\", \"mods\": \"ctrl+shift\", \"action\": \"paste\" },\n");
@@ -1844,9 +1862,8 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
         }
 
         if (ctrl_pressed && !alt_pressed && !shift_pressed && (sym == XKB_KEY_l || sym == XKB_KEY_L)) {
-            app.scrollback_offset = 0;
+            clear_full_history();
             write(app.pty_master, "\x0c", 1);
-            app.needs_render = 1;
             return;
         }
 
@@ -2221,6 +2238,10 @@ int main(int argc, char *argv[]) {
                 }
 
                 (void)write;
+
+                if (strstr(buf, "\033[2J") || strstr(buf, "\033[3J")) {
+                    clear_full_history();
+                }
 
                 if (strstr(buf, "\033[?1049h") || strstr(buf, "\033[?47h") || strstr(buf, "\033[?1047h")) {
                     app.is_altscreen = 1;

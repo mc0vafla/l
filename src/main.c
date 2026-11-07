@@ -156,6 +156,7 @@ typedef struct {
 } Term;
 
 static Term app = {0};
+
 static void render(void);
 static void create_buffer(void);
 static void cleanup_buffer(void);
@@ -2239,8 +2240,10 @@ int main(int argc, char *argv[]) {
 
                 (void)write;
 
-                if (strstr(buf, "\033[2J") || strstr(buf, "\033[3J")) {
-                    clear_full_history();
+                if (strstr(buf, "\033[3J") || (strstr(buf, "\033[J") && !app.is_altscreen)) {
+                    if (strstr(buf, "3J") || (strstr(buf, "2J") && strstr(buf, "H"))) {
+                        clear_full_history();
+                    }
                 }
 
                 if (strstr(buf, "\033[?1049h") || strstr(buf, "\033[?47h") || strstr(buf, "\033[?1047h")) {

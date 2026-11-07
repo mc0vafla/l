@@ -687,8 +687,6 @@ static void update_cursor_shape(uint32_t serial) {
     struct wl_cursor *cursor = app.cursor_default;
     int is_text = 0;
 
-    // Палочка отображается только если мы не в altscreen (не в vim/btop и т.д.) 
-    // и курсор наведен на область текста внутри терминала (не на скроллбар)
     if (!app.is_altscreen) {
         int pr = get_padding_right();
         double text_right_bound = (double)app.width - pr;

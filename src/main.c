@@ -44,7 +44,7 @@
 typedef struct {
     xkb_keysym_t sym;
     uint32_t modifiers;
-    char actions[MAX_ACTIONS_PER_BIND][128];
+    char actions[MAX_ACTIONS_PER_BIND][256];
     int actions_count;
 } KeyBind;
 
@@ -128,6 +128,9 @@ typedef struct {
 
     int mouse_reporting;
     int left_button_pressed;
+    int middle_button_pressed;
+    double middle_drag_start_y;
+    int middle_drag_start_offset;
     int is_altscreen;
     int dragging_scrollbar;
 
@@ -380,8 +383,8 @@ static void load_config(void) {
             fprintf(df, "    { \"key\": \"v\", \"mods\": \"ctrl+shift\", \"action\": \"paste\" },\n");
             fprintf(df, "    { \"key\": \"equal\", \"mods\": \"ctrl\", \"action\": \"font_increase\" },\n");
             fprintf(df, "    { \"key\": \"minus\", \"mods\": \"ctrl\", \"action\": \"font_decrease\" },\n");
-            fprintf(df, "    { \"key\": \"x\", \"mods\": \"alt\", \"actions\": [\"u\", \"Return\"] },\n");
-            fprintf(df, "    { \"key\": \"z\", \"mods\": \"alt\", \"actions\": [\"dell\", \"Return\"] }\n");
+            fprintf(df, "    { \"key\": \"x\", \"mods\": \"alt\", \"actions\": [\"u\", \"\\r\"] },\n");
+            fprintf(df, "    { \"key\": \"z\", \"mods\": \"alt\", \"actions\": [\"dell\", \"\\r\"] }\n");
             fprintf(df, "  ]\n");
             fprintf(df, "}\n");
             fclose(df);
@@ -826,8 +829,7 @@ static void update_search_matches(void) {
 
             if (!found) break;
 
-            int char_idx = (int)(found - line_chars);
-            temp_matches[count++] = (SearchMatch){.row = r, .col = char_idx, .len = app.search_query_len};
+            temp_matches[count++] = (SearchMatch){.row = r, .col = 0, .len = app.cols};
             found += app.search_query_len;
         }
     }
@@ -875,7 +877,7 @@ static void copy_selection_to_clipboard(void) {
 
         for (int c = start_c; c <= end_c; c++) {
             VTermScreenCell cell;
-            int target_row = r - app.scrollback_offset;
+            int target_row = r - app.scrollback_count;
             if (target_row < 0) {
                 int sb_idx = (app.scrollback_head + target_row + SCROLLBACK_SIZE) % SCROLLBACK_SIZE;
                 if (app.scrollback[sb_idx]) {
@@ -1104,15 +1106,15 @@ static void render(void) {
     cairo_restore(app.cr);
 
     if (app.search_active && !app.is_altscreen) {
-        double panel_y = (double)app.height - panel_height;
+        double panel_y = (double)app.height - panel_height - (double)app.padding_y;
 
         cairo_save(app.cr);
         cairo_set_source_rgb(app.cr, bg_r, bg_g, bg_b);
-        cairo_rectangle(app.cr, 0, panel_y, (double)app.width, panel_height);
+        cairo_rectangle(app.cr, (double)app.padding_x, panel_y, (double)app.width - (2.0 * app.padding_x), panel_height);
         cairo_fill(app.cr);
 
         cairo_set_source_rgba(app.cr, 0.15, 0.15, 0.15, 0.95);
-        cairo_rectangle(app.cr, 0, panel_y, (double)app.width, panel_height);
+        cairo_rectangle(app.cr, (double)app.padding_x, panel_y, (double)app.width - (2.0 * app.padding_x), panel_height);
         cairo_fill(app.cr);
 
         char panel_text[512];
@@ -1123,9 +1125,31 @@ static void render(void) {
         }
 
         cairo_set_source_rgb(app.cr, default_fg_r, default_fg_g, default_fg_b);
-        cairo_move_to(app.cr, 10.0, panel_y + 2.0);
+        cairo_move_to(app.cr, (double)app.padding_x + 10.0, panel_y + 2.0);
         pango_layout_set_text(app.pango_layout, panel_text, strlen(panel_text));
         pango_cairo_show_layout(app.cr, app.pango_layout);
+
+        char query_part[512];
+        snprintf(query_part, sizeof(query_part), "Search: %s", app.search_query);
+        int query_width_px = 0;
+        PangoLayout *layout_q = pango_cairo_create_layout(app.cr);
+        pango_layout_set_font_description(layout_q, app.font_desc);
+        pango_layout_set_text(layout_q, query_part, strlen(query_part));
+        pango_layout_get_pixel_size(layout_q, &query_width_px, NULL);
+        g_object_unref(layout_q);
+
+        double cursor_x_pos = (double)app.padding_x + 10.0 + (double)query_width_px;
+        double cursor_y_pos = panel_y + 2.0;
+        double cursor_h = (double)app.font_height;
+
+        double cursor_r = app.palette[1][0];
+        double cursor_g = app.palette[1][1];
+        double cursor_b = app.palette[1][2];
+
+        cairo_set_source_rgb(app.cr, cursor_r, cursor_g, cursor_b);
+        cairo_rectangle(app.cr, cursor_x_pos, cursor_y_pos, 2.0, cursor_h);
+        cairo_fill(app.cr);
+
         cairo_restore(app.cr);
     }
 
@@ -1393,9 +1417,29 @@ static void pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32
         if (rel_y > content_height) rel_y = content_height;
 
         double ratio = rel_y / content_height;
-        app.scrollback_offset = (int)((1.0 - ratio) * (double)app.scrollback_count);
-        if (app.scrollback_offset < 0) app.scrollback_offset = 0;
-        if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
+        int new_offset = (int)((1.0 - ratio) * (double)app.scrollback_count);
+        if (new_offset < 0) new_offset = 0;
+        if (new_offset > app.scrollback_count) new_offset = app.scrollback_count;
+        if (new_offset != app.scrollback_offset) {
+            app.scrollback_offset = new_offset;
+            app.selecting = 0;
+            app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
+        }
+        return;
+    }
+
+    if (app.middle_button_pressed && !app.is_altscreen && app.scrollback_count > 0) {
+        double dy = app.mouse_y - app.middle_drag_start_y;
+        int lines_delta = (int)(dy / (double)app.font_height);
+        int new_offset = app.middle_drag_start_offset + lines_delta;
+        if (new_offset < 0) new_offset = 0;
+        if (new_offset > app.scrollback_count) new_offset = app.scrollback_count;
+        if (new_offset != app.scrollback_offset) {
+            app.scrollback_offset = new_offset;
+            app.selecting = 0;
+            app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
+        }
+        app.needs_render = 1;
         return;
     }
 
@@ -1442,7 +1486,12 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer, uint32
                 double ratio = rel_y / content_height;
                 if (ratio < 0) ratio = 0;
                 if (ratio > 1) ratio = 1;
-                app.scrollback_offset = (int)((1.0 - ratio) * (double)app.scrollback_count);
+                int new_offset = (int)((1.0 - ratio) * (double)app.scrollback_count);
+                if (new_offset != app.scrollback_offset) {
+                    app.scrollback_offset = new_offset;
+                    app.selecting = 0;
+                    app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
+                }
                 app.needs_render = 1;
                 return;
             }
@@ -1490,15 +1539,21 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer, uint32
             }
         }
         app.needs_render = 1;
+    } else if (button == 0x111) {
+        if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
+            app.middle_button_pressed = 1;
+            app.middle_drag_start_y = app.mouse_y;
+            app.middle_drag_start_offset = app.scrollback_offset;
+        } else if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
+            app.middle_button_pressed = 0;
+        }
+        app.needs_render = 1;
     }
 }
 
 static void pointer_handle_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value) {
     double delta = wl_fixed_to_double(value);
     if (delta == 0) return;
-
-    app.selecting = 0;
-    app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
 
     if (app.is_altscreen && app.mouse_reporting) {
         int row = (int)((app.mouse_y - app.padding_y) / app.font_height);
@@ -1509,10 +1564,15 @@ static void pointer_handle_axis(void *data, struct wl_pointer *pointer, uint32_t
     }
 
     int lines = (int)(delta > 0 ? -3 : 3);
-    app.scrollback_offset += lines;
+    int new_offset = app.scrollback_offset + lines;
+    if (new_offset < 0) new_offset = 0;
+    if (new_offset > app.scrollback_count) new_offset = app.scrollback_count;
 
-    if (app.scrollback_offset < 0) app.scrollback_offset = 0;
-    if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
+    if (new_offset != app.scrollback_offset) {
+        app.scrollback_offset = new_offset;
+        app.selecting = 0;
+        app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
+    }
     app.needs_render = 1;
 }
 
@@ -1521,9 +1581,6 @@ static void pointer_handle_axis_source(void *data, struct wl_pointer *pointer, u
 static void pointer_handle_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis) {}
 static void pointer_handle_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete) {
     if (discrete == 0) return;
-
-    app.selecting = 0;
-    app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
 
     if (app.is_altscreen && app.mouse_reporting) {
         int row = (int)((app.mouse_y - app.padding_y) / app.font_height);
@@ -1537,10 +1594,15 @@ static void pointer_handle_axis_discrete(void *data, struct wl_pointer *pointer,
     }
 
     int lines = discrete * -3;
-    app.scrollback_offset += lines;
+    int new_offset = app.scrollback_offset + lines;
+    if (new_offset < 0) new_offset = 0;
+    if (new_offset > app.scrollback_count) new_offset = app.scrollback_count;
 
-    if (app.scrollback_offset < 0) app.scrollback_offset = 0;
-    if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
+    if (new_offset != app.scrollback_offset) {
+        app.scrollback_offset = new_offset;
+        app.selecting = 0;
+        app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
+    }
     app.needs_render = 1;
 }
 
@@ -1640,7 +1702,30 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
                     } else if (strcasecmp(action, "Return") == 0 || strcasecmp(action, "Enter") == 0) {
                         write(app.pty_master, "\r", 1);
                     } else {
-                        write(app.pty_master, action, strlen(action));
+                        for (int j = 0; action[j] != '\0'; j++) {
+                            if (action[j] == '\\' && action[j+1] != '\0') {
+                                char next = action[j+1];
+                                if (next == 'n' || next == 'r') {
+                                    write(app.pty_master, "\r", 1);
+                                    j++;
+                                } else if (next == 't') {
+                                    write(app.pty_master, "\t", 1);
+                                    j++;
+                                } else if (next == 'b') {
+                                    write(app.pty_master, "\x7f", 1);
+                                    j++;
+                                } else if (next == 'e') {
+                                    write(app.pty_master, "\x1b", 1);
+                                    j++;
+                                } else {
+                                    write(app.pty_master, &action[j], 1);
+                                }
+                            } else if (action[j] == '\n') {
+                                write(app.pty_master, "\r", 1);
+                            } else {
+                                write(app.pty_master, &action[j], 1);
+                            }
+                        }
                     }
                 }
                 return;
@@ -1684,22 +1769,59 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
                     app.needs_render = 1;
                 }
                 return;
+            } else if (ctrl_pressed && (sym == XKB_KEY_w || sym == XKB_KEY_W || keycode == 22 || sym == 65288 || sym == XKB_KEY_BackSpace)) {
+                if (app.search_query_len > 0) {
+                    if (ctrl_pressed && (sym == XKB_KEY_w || sym == XKB_KEY_W || sym == 65288 || keycode == 22)) {
+                        while (app.search_query_len > 0 && app.search_query[app.search_query_len - 1] == ' ') {
+                            app.search_query[--app.search_query_len] = '\0';
+                        }
+                        while (app.search_query_len > 0 && app.search_query[app.search_query_len - 1] != ' ') {
+                            app.search_query[--app.search_query_len] = '\0';
+                        }
+                    } else {
+                        app.search_query[--app.search_query_len] = '\0';
+                    }
+                    update_search_matches();
+                }
+
+                app.held_keycode = keycode;
+                app.held_bytes_len = 0;
+                long long now = get_time_ms();
+                int delay = app.repeat_delay_ms > 0 ? app.repeat_delay_ms : 250;
+                app.next_repeat_time_ms = now + delay;
+                app.is_repeating = 0;
+                return;
             } else if (keycode == 22 || sym == 65288 || sym == XKB_KEY_BackSpace) {
                 if (app.search_query_len > 0) {
                     app.search_query[--app.search_query_len] = '\0';
                     update_search_matches();
                 }
+
+                app.held_keycode = keycode;
+                app.held_bytes_len = 0;
+                long long now = get_time_ms();
+                int delay = app.repeat_delay_ms > 0 ? app.repeat_delay_ms : 250;
+                app.next_repeat_time_ms = now + delay;
+                app.is_repeating = 0;
                 return;
             } else {
                 char buf[32] = {0};
                 int len = app.xkb_state ? xkb_state_key_get_utf8(app.xkb_state, keycode, buf, sizeof(buf)) : 0;
-                if (len > 0 && buf[0] >= 32 && buf[0] < 127) {
+                if (len > 0 && buf[0] >= 32 && buf[0] < 127 && !ctrl_pressed) {
                     if (app.search_query_len + len < (int)sizeof(app.search_query) - 1) {
                         memcpy(app.search_query + app.search_query_len, buf, len);
                         app.search_query_len += len;
                         app.search_query[app.search_query_len] = '\0';
                         update_search_matches();
                     }
+
+                    app.held_keycode = keycode;
+                    app.held_bytes_len = len;
+                    memcpy(app.held_bytes, buf, len);
+                    long long now = get_time_ms();
+                    int delay = app.repeat_delay_ms > 0 ? app.repeat_delay_ms : 250;
+                    app.next_repeat_time_ms = now + delay;
+                    app.is_repeating = 0;
                 }
                 return;
             }
@@ -2015,7 +2137,35 @@ int main(int argc, char *argv[]) {
         if (app.held_keycode != 0) {
             long long now = get_time_ms();
             if (now >= app.next_repeat_time_ms) {
-                write(app.pty_master, app.held_bytes, app.held_bytes_len);
+                if (app.search_active && !app.is_altscreen) {
+                    int ctrl_pressed = app.xkb_state ? xkb_state_mod_name_is_active(app.xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) : 0;
+                    xkb_keysym_t sym = app.xkb_state ? xkb_state_key_get_one_sym(app.xkb_state, app.held_keycode) : XKB_KEY_NoSymbol;
+
+                    if ((ctrl_pressed && (sym == XKB_KEY_w || sym == XKB_KEY_W)) || app.held_keycode == 22 || sym == 65288 || sym == XKB_KEY_BackSpace) {
+                        if (app.search_query_len > 0) {
+                            if (ctrl_pressed && (sym == XKB_KEY_w || sym == XKB_KEY_W || sym == 65288 || app.held_keycode == 22)) {
+                                while (app.search_query_len > 0 && app.search_query[app.search_query_len - 1] == ' ') {
+                                    app.search_query[--app.search_query_len] = '\0';
+                                }
+                                while (app.search_query_len > 0 && app.search_query[app.search_query_len - 1] != ' ') {
+                                    app.search_query[--app.search_query_len] = '\0';
+                                }
+                            } else {
+                                app.search_query[--app.search_query_len] = '\0';
+                            }
+                            update_search_matches();
+                        }
+                    } else if (app.held_bytes_len > 0 && !ctrl_pressed) {
+                        if (app.search_query_len + app.held_bytes_len < (int)sizeof(app.search_query) - 1) {
+                            memcpy(app.search_query + app.search_query_len, app.held_bytes, app.held_bytes_len);
+                            app.search_query_len += app.held_bytes_len;
+                            app.search_query[app.search_query_len] = '\0';
+                            update_search_matches();
+                        }
+                    }
+                } else {
+                    write(app.pty_master, app.held_bytes, app.held_bytes_len);
+                }
                 int rate = app.repeat_rate_hz > 0 ? app.repeat_rate_hz : 30;
                 app.next_repeat_time_ms = now + (1000 / rate);
             }
@@ -2069,6 +2219,8 @@ int main(int argc, char *argv[]) {
                 if (strstr(buf, "\033[?1000l") || strstr(buf, "\033[?1002l") || strstr(buf, "\033[?1006l")) {
                     app.mouse_reporting = 0;
                 }
+
+                (void)write;
 
                 if (strstr(buf, "\033[?1049h") || strstr(buf, "\033[?47h") || strstr(buf, "\033[?1047h")) {
                     app.is_altscreen = 1;

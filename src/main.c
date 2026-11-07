@@ -8,12 +8,15 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/time.h>
+#include <sys/inotify.h>
 #include <pty.h>
 #include <locale.h>
 #include <errno.h>
 #include <termios.h>
-
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <wayland-client.h>
+
 #include <wayland-cursor.h>
 #include <xkbcommon/xkbcommon.h>
 #include <cairo/cairo.h>
@@ -29,7 +32,7 @@
 #define DEFAULT_HEIGHT 600
 
 #define MAX_CUSTOM_BINDS 64
-#define MAX_ACTIONS_PER_BIND 8
+#define MAX_ACTIONS_PER_BIND 16
 
 #define MIN_VTERM_COLS 80
 #define MIN_VTERM_ROWS 24
@@ -40,7 +43,7 @@
 typedef struct {
     xkb_keysym_t sym;
     uint32_t modifiers;
-    char actions[MAX_ACTIONS_PER_BIND][64];
+    char actions[MAX_ACTIONS_PER_BIND][128];
     int actions_count;
 } KeyBind;
 
@@ -59,6 +62,12 @@ typedef struct {
     struct xdg_toplevel *xdg_toplevel;
     struct wl_buffer *buffer;
     struct wl_callback *frame_callback;
+
+    struct wl_cursor_theme *cursor_theme;
+    struct wl_cursor *cursor_text;
+    struct wl_cursor *cursor_default;
+    struct wl_surface *cursor_surface;
+    int current_cursor_is_text;
 
     void *shm_data;
     size_t shm_size;
@@ -125,6 +134,9 @@ typedef struct {
 
     uint32_t active_bind_keycode;
     int cursor_shape;
+
+    int inotify_fd;
+    int inotify_wd;
 } Term;
 
 static Term app = {0};
@@ -133,6 +145,7 @@ static void create_buffer(void);
 static void cleanup_buffer(void);
 static void resize_pty(void);
 static void copy_selection_to_clipboard(void);
+static void update_cursor_shape(uint32_t serial);
 static const struct wl_callback_listener frame_listener;
 
 static const double default_palette[16][3] = {
@@ -155,7 +168,7 @@ static const double default_palette[16][3] = {
 };
 
 static inline int get_padding_right(void) {
-    return app.padding_x + SCROLLBAR_WIDTH + 4;
+    return app.padding_x + SCROLLBAR_WIDTH + 8;
 }
 
 static long long get_time_ms(void) {
@@ -226,6 +239,10 @@ static void load_config(void) {
     const char *home = getenv("HOME");
     snprintf(path, sizeof(path), "%s/.config/l/config.json", home ? home : "/root");
 
+    if (app.font_family) { free(app.font_family); app.font_family = NULL; }
+    if (app.font_name) { free(app.font_name); app.font_name = NULL; }
+    if (app.shell) { free(app.shell); app.shell = NULL; }
+
     app.font_family = strdup(DEFAULT_FONT_NAME);
     app.font_size = DEFAULT_FONT_SIZE;
     app.bg_color = 0x282828;
@@ -243,27 +260,20 @@ static void load_config(void) {
         FILE *df = fopen(path, "w");
         if (df) {
             fprintf(df, "{\n");
-            fprintf(df, "  // Font family configuration\n");
             fprintf(df, "  \"font_family\": \"%s\",\n", DEFAULT_FONT_NAME);
-            fprintf(df, "  // Font size in points\n");
             fprintf(df, "  \"font_size\": %d,\n", DEFAULT_FONT_SIZE);
-            fprintf(df, "  // Background color (hex format)\n");
             fprintf(df, "  \"bg_color\": \"#282828\",\n");
-            fprintf(df, "  // Foreground color (hex format)\n");
             fprintf(df, "  \"fg_color\": \"#d3c6aa\",\n");
-            fprintf(df, "  // Horizontal padding in pixels\n");
             fprintf(df, "  \"padding_x\": 6,\n");
-            fprintf(df, "  // Vertical padding in pixels\n");
             fprintf(df, "  \"padding_y\": 6,\n");
-            fprintf(df, "  // Default shell binary\n");
             fprintf(df, "  \"shell\": \"fish\",\n");
-            fprintf(df, "  // Custom keybindings list\n");
             fprintf(df, "  \"binds\": [\n");
             fprintf(df, "    { \"key\": \"c\", \"mods\": \"ctrl+shift\", \"action\": \"copy\" },\n");
+            fprintf(df, "    { \"key\": \"v\", \"mods\": \"ctrl+shift\", \"action\": \"paste\" },\n");
             fprintf(df, "    { \"key\": \"equal\", \"mods\": \"ctrl\", \"action\": \"font_increase\" },\n");
             fprintf(df, "    { \"key\": \"minus\", \"mods\": \"ctrl\", \"action\": \"font_decrease\" },\n");
-            fprintf(df, "    // Alt+X example: sequence of multiple actions executed sequentially (types 'u' then presses Enter)\n");
-            fprintf(df, "    { \"key\": \"x\", \"mods\": \"alt\", \"actions\": [\"u\", \"Return\"] }\n");
+            fprintf(df, "    { \"key\": \"x\", \"mods\": \"alt\", \"actions\": [\"u\", \"Return\"] },\n");
+            fprintf(df, "    { \"key\": \"z\", \"mods\": \"alt\", \"actions\": [\"dell\", \"Return\"] }\n");
             fprintf(df, "  ]\n");
             fprintf(df, "}\n");
             fclose(df);
@@ -296,7 +306,7 @@ static void load_config(void) {
     strip_json_comments(buf);
 
     jsmn_parser p;
-    jsmntok_t t[512];
+    jsmntok_t t[1024];
     jsmn_init(&p);
     int r = jsmn_parse(&p, buf, len, t, sizeof(t) / sizeof(t[0]));
 
@@ -331,49 +341,45 @@ static void load_config(void) {
                 i++;
             } else if (jsmntyeq(buf, &t[i], "binds") && i + 1 < r && t[i+1].type == JSMN_ARRAY) {
                 int array_size = t[i+1].size;
-                int token_idx = i + 2;
+                int idx = i + 2;
                 for (int b = 0; b < array_size && app.binds_count < MAX_CUSTOM_BINDS; b++) {
-                    if (t[token_idx].type == JSMN_OBJECT) {
-                        int obj_size = t[token_idx].size;
-                        token_idx++;
+                    if (idx >= r) break;
+                    if (t[idx].type == JSMN_OBJECT) {
+                        int obj_size = t[idx].size;
+                        idx++;
                         char *k_str = NULL;
                         char *m_str = NULL;
-                        
                         KeyBind kb = {0};
                         kb.actions_count = 0;
 
                         for (int o = 0; o < obj_size; o++) {
-                            if (jsmntyeq(buf, &t[token_idx], "key")) {
-                                k_str = strndup(buf + t[token_idx+1].start, t[token_idx+1].end - t[token_idx+1].start);
-                                token_idx += 2;
-                            } else if (jsmntyeq(buf, &t[token_idx], "mods")) {
-                                m_str = strndup(buf + t[token_idx+1].start, t[token_idx+1].end - t[token_idx+1].start);
-                                token_idx += 2;
-                            } else if (jsmntyeq(buf, &t[token_idx], "action")) {
-                                if (t[token_idx+1].type == JSMN_STRING && kb.actions_count < MAX_ACTIONS_PER_BIND) {
-                                    char *act = strndup(buf + t[token_idx+1].start, t[token_idx+1].end - t[token_idx+1].start);
+                            if (idx >= r) break;
+                            if (jsmntyeq(buf, &t[idx], "key") && idx + 1 < r) {
+                                k_str = strndup(buf + t[idx+1].start, t[idx+1].end - t[idx+1].start);
+                                idx += 2;
+                            } else if (jsmntyeq(buf, &t[idx], "mods") && idx + 1 < r) {
+                                m_str = strndup(buf + t[idx+1].start, t[idx+1].end - t[idx+1].start);
+                                idx += 2;
+                            } else if (jsmntyeq(buf, &t[idx], "action") && idx + 1 < r) {
+                                if (t[idx+1].type == JSMN_STRING && kb.actions_count < MAX_ACTIONS_PER_BIND) {
+                                    char *act = strndup(buf + t[idx+1].start, t[idx+1].end - t[idx+1].start);
                                     snprintf(kb.actions[kb.actions_count++], sizeof(kb.actions[0]), "%s", act);
                                     free(act);
                                 }
-                                token_idx += 2;
-                            } else if (jsmntyeq(buf, &t[token_idx], "actions")) {
-                                if (t[token_idx+1].type == JSMN_ARRAY) {
-                                    int acts_array_size = t[token_idx+1].size;
-                                    int acts_token_idx = token_idx + 2;
-                                    for (int a = 0; a < acts_array_size && kb.actions_count < MAX_ACTIONS_PER_BIND; a++) {
-                                        if (t[acts_token_idx].type == JSMN_STRING) {
-                                            char *act = strndup(buf + t[acts_token_idx].start, t[acts_token_idx].end - t[acts_token_idx].start);
-                                            snprintf(kb.actions[kb.actions_count++], sizeof(kb.actions[0]), "%s", act);
-                                            free(act);
-                                        }
-                                        acts_token_idx += 1;
+                                idx += 2;
+                            } else if (jsmntyeq(buf, &t[idx], "actions") && idx + 1 < r && t[idx+1].type == JSMN_ARRAY) {
+                                int acts_count = t[idx+1].size;
+                                idx += 2;
+                                for (int a = 0; a < acts_count; a++) {
+                                    if (idx < r && t[idx].type == JSMN_STRING && kb.actions_count < MAX_ACTIONS_PER_BIND) {
+                                        char *act = strndup(buf + t[idx].start, t[idx].end - t[idx].start);
+                                        snprintf(kb.actions[kb.actions_count++], sizeof(kb.actions[0]), "%s", act);
+                                        free(act);
                                     }
-                                    token_idx = acts_token_idx;
-                                } else {
-                                    token_idx += 2;
+                                    idx++;
                                 }
                             } else {
-                                token_idx += 2;
+                                idx += 2;
                             }
                         }
 
@@ -390,10 +396,10 @@ static void load_config(void) {
                         free(k_str);
                         free(m_str);
                     } else {
-                        token_idx += 1;
+                        idx++;
                     }
                 }
-                i = token_idx - 1;
+                i = idx - 1;
             }
         }
     }
@@ -402,6 +408,34 @@ static void load_config(void) {
     snprintf(full_font, sizeof(full_font), "%s %d", app.font_family, app.font_size);
     app.font_name = strdup(full_font);
     free(buf);
+}
+
+static void paste_from_clipboard(void) {
+    FILE *pipe = popen("wl-paste -n", "r");
+    if (!pipe) return;
+
+    int in_alt = app.is_altscreen;
+
+    if (in_alt) {
+        write(app.pty_master, "i", 1);
+        usleep(15000);
+    }
+
+    write(app.pty_master, "\033[?2004h", 8);
+
+    char clip_buf[4096];
+    size_t n;
+    while ((n = fread(clip_buf, 1, sizeof(clip_buf), pipe)) > 0) {
+        write(app.pty_master, clip_buf, n);
+    }
+    pclose(pipe);
+
+    write(app.pty_master, "\033[?2004l", 8);
+
+    if (in_alt) {
+        usleep(15000);
+        write(app.pty_master, "\x1b", 1);
+    }
 }
 
 static int create_shm_file(off_t size) {
@@ -551,11 +585,16 @@ static void get_cell_colors(VTermScreenCell *cell, double default_r, double defa
 }
 
 static int is_cell_selected(int r, int c) {
+    if (app.is_altscreen) return 0;
     if (!app.selecting && (app.sel_start_row == app.sel_end_row && app.sel_start_col == app.sel_end_col)) 
         return 0;
 
     int r1 = app.sel_start_row, c1 = app.sel_start_col;
     int r2 = app.sel_end_row, c2 = app.sel_end_col;
+
+    if (r1 == r2 && c1 == c2) {
+        return 0;
+    }
 
     if (r1 > r2 || (r1 == r2 && c1 > c2)) {
         r1 = app.sel_end_row; c1 = app.sel_end_col;
@@ -575,8 +614,11 @@ static int is_cell_selected(int r, int c) {
 }
 
 static void copy_selection_to_clipboard(void) {
+    if (app.is_altscreen) return;
     int r1 = app.sel_start_row, c1 = app.sel_start_col;
     int r2 = app.sel_end_row, c2 = app.sel_end_col;
+
+    if (r1 == r2 && c1 == c2) return;
 
     if (r1 > r2 || (r1 == r2 && c1 > c2)) {
         r1 = app.sel_end_row; c1 = app.sel_end_col;
@@ -604,6 +646,7 @@ static void copy_selection_to_clipboard(void) {
                     cell.chars[0] = ' ';
                 }
             } else {
+                if (target_row >= app.rows) target_row = app.rows - 1;
                 vterm_screen_get_cell(app.vtscreen, (VTermPos){target_row, c}, &cell);
             }
 
@@ -636,6 +679,42 @@ static void copy_selection_to_clipboard(void) {
         pclose(pipe);
     }
     free(text_buf);
+}
+
+static void update_cursor_shape(uint32_t serial) {
+    if (!app.pointer) return;
+
+    struct wl_cursor *cursor = app.cursor_default;
+    int is_text = 0;
+
+    // Палочка отображается только если мы не в altscreen (не в vim/btop и т.д.) 
+    // и курсор наведен на область текста внутри терминала (не на скроллбар)
+    if (!app.is_altscreen) {
+        int pr = get_padding_right();
+        double text_right_bound = (double)app.width - pr;
+        if (app.mouse_x >= app.padding_x && app.mouse_x < text_right_bound &&
+            app.mouse_y >= app.padding_y && app.mouse_y < app.height - app.padding_y) {
+            is_text = 1;
+            cursor = app.cursor_text ? app.cursor_text : app.cursor_default;
+        }
+    }
+
+    app.current_cursor_is_text = is_text;
+
+    if (cursor && cursor->image_count > 0) {
+        struct wl_cursor_image *image = cursor->images[0];
+        struct wl_buffer *buffer = wl_cursor_image_get_buffer(image);
+        
+        if (!app.cursor_surface) {
+            app.cursor_surface = wl_compositor_create_surface(app.compositor);
+        }
+
+        wl_surface_attach(app.cursor_surface, buffer, 0, 0);
+        wl_surface_damage(app.cursor_surface, 0, 0, image->width, image->height);
+        wl_surface_commit(app.cursor_surface);
+
+        wl_pointer_set_cursor(app.pointer, serial, app.cursor_surface, image->hotspot_x, image->hotspot_y);
+    }
 }
 
 static void render(void) {
@@ -788,15 +867,21 @@ static void render(void) {
         double scroll_ratio = (max_scroll > 0) ? ((double)app.scrollback_offset / max_scroll) : 0.0;
         double thumb_y = (content_height - thumb_height) * (1.0 - scroll_ratio);
 
-        double sb_x = (double)app.width - SCROLLBAR_WIDTH - 2;
         double sb_w = SCROLLBAR_WIDTH;
+        double sb_x = (double)app.width - sb_w - 6;
+        
+        int is_hovered = app.dragging_scrollbar || (app.mouse_x >= sb_x - 4 && app.mouse_x <= (double)app.width &&
+                          app.mouse_y >= app.padding_y && app.mouse_y <= app.padding_y + content_height);
 
-        cairo_set_source_rgba(app.cr, 0.5, 0.5, 0.5, 0.15);
-        cairo_rectangle(app.cr, sb_x, (double)app.padding_y, sb_w, content_height);
+        double active_sb_width = is_hovered ? (sb_w + 3) : sb_w;
+        double render_sb_x = (double)app.width - active_sb_width - 4;
+
+        cairo_set_source_rgba(app.cr, 0.5, 0.5, 0.5, is_hovered ? 0.35 : 0.15);
+        cairo_rectangle(app.cr, render_sb_x, (double)app.padding_y, active_sb_width, content_height);
         cairo_fill(app.cr);
 
-        cairo_set_source_rgba(app.cr, 0.7, 0.7, 0.7, 0.5);
-        cairo_rectangle(app.cr, sb_x, (double)app.padding_y + thumb_y, sb_w, thumb_height);
+        cairo_set_source_rgba(app.cr, 0.9, 0.9, 0.9, is_hovered ? 0.9 : 0.5);
+        cairo_rectangle(app.cr, render_sb_x, (double)app.padding_y + thumb_y, active_sb_width, thumb_height);
         cairo_fill(app.cr);
     }
 
@@ -1005,12 +1090,29 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
     .ping = xdg_wm_base_ping,
 };
 
-static void pointer_handle_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy) {}
-static void pointer_handle_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface) {}
+static void pointer_handle_enter(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface, wl_fixed_t sx, wl_fixed_t sy) {
+    app.mouse_x = wl_fixed_to_double(sx);
+    app.mouse_y = wl_fixed_to_double(sy);
+    update_cursor_shape(serial);
+}
+
+static void pointer_handle_leave(void *data, struct wl_pointer *pointer, uint32_t serial, struct wl_surface *surface) {
+    app.needs_render = 1;
+}
 
 static void pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {
     app.mouse_x = wl_fixed_to_double(sx);
     app.mouse_y = wl_fixed_to_double(sy);
+
+    app.needs_render = 1;
+
+    int pr = get_padding_right();
+    double text_right_bound = (double)app.width - pr;
+    int is_text = (!app.is_altscreen && app.mouse_x >= app.padding_x && app.mouse_x < text_right_bound &&
+                   app.mouse_y >= app.padding_y && app.mouse_y < app.height - app.padding_y);
+    if (is_text != app.current_cursor_is_text) {
+        update_cursor_shape(time);
+    }
 
     if (app.dragging_scrollbar && !app.is_altscreen && app.scrollback_count > 0) {
         double content_height = (double)(app.rows * app.font_height);
@@ -1022,7 +1124,6 @@ static void pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32
         app.scrollback_offset = (int)((1.0 - ratio) * (double)app.scrollback_count);
         if (app.scrollback_offset < 0) app.scrollback_offset = 0;
         if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
-        app.needs_render = 1;
         return;
     }
 
@@ -1038,11 +1139,10 @@ static void pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32
             send_mouse_report(32, 0, col, row);
         }
     } else {
-        if (app.selecting) {
+        if (!app.is_altscreen && app.selecting) {
             if (app.sel_end_col != col || app.sel_end_row != row) {
                 app.sel_end_col = col;
                 app.sel_end_row = row;
-                app.needs_render = 1;
             }
         }
     }
@@ -1050,10 +1150,17 @@ static void pointer_handle_motion(void *data, struct wl_pointer *pointer, uint32
 
 static void pointer_handle_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
     if (button == 0x110) {
+        int col = (int)((app.mouse_x - app.padding_x) / app.font_width);
+        int row = (int)((app.mouse_y - app.padding_y) / app.font_height);
+        if (col < 0) col = 0;
+        if (col >= app.cols) col = app.cols - 1;
+        if (row < 0) row = 0;
+        if (row >= app.rows) row = app.rows - 1;
+
         if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
             app.left_button_pressed = 1;
 
-            double sb_x = (double)app.width - SCROLLBAR_WIDTH - 6;
+            double sb_x = (double)app.width - SCROLLBAR_WIDTH - 12;
             if (!app.is_altscreen && app.scrollback_count > 0 && app.mouse_x >= sb_x) {
                 app.dragging_scrollbar = 1;
                 double content_height = (double)(app.rows * app.font_height);
@@ -1065,23 +1172,15 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer, uint32
                 app.needs_render = 1;
                 return;
             }
-        } else if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
-            app.left_button_pressed = 0;
-            app.dragging_scrollbar = 0;
-        }
 
-        int col = (int)((app.mouse_x - app.padding_x) / app.font_width);
-        int row = (int)((app.mouse_y - app.padding_y) / app.font_height);
-        if (col < 0) col = 0;
-        if (col >= app.cols) col = app.cols - 1;
-        if (row < 0) row = 0;
-        if (row >= app.rows) row = app.rows - 1;
+            if (app.mouse_reporting) {
+                send_mouse_report(0, 0, col, row);
+            } else {
+                if (!app.is_altscreen) {
+                    app.selecting = 0;
+                    app.sel_start_row = app.sel_end_row = row;
+                    app.sel_start_col = app.sel_end_col = col;
 
-        if (app.mouse_reporting) {
-            send_mouse_report(0, (state == WL_POINTER_BUTTON_STATE_RELEASED), col, row);
-        } else {
-            if (!app.dragging_scrollbar) {
-                if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
                     long long now = get_time_ms();
                     if ((now - app.last_click_time_ms < 400) && (app.last_click_row == row) && (app.last_click_col == col)) {
                         app.selection_mode = 2; 
@@ -1102,18 +1201,30 @@ static void pointer_handle_button(void *data, struct wl_pointer *pointer, uint32
                         app.last_click_col = col;
                         app.last_click_row = row;
                     }
-                } else if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
+                }
+            }
+        } else if (state == WL_POINTER_BUTTON_STATE_RELEASED) {
+            app.left_button_pressed = 0;
+            app.dragging_scrollbar = 0;
+
+            if (app.mouse_reporting) {
+                send_mouse_report(0, 1, col, row);
+            } else {
+                if (!app.is_altscreen) {
                     app.selecting = 0;
                 }
-                app.needs_render = 1;
             }
         }
+        app.needs_render = 1;
     }
 }
 
 static void pointer_handle_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis, wl_fixed_t value) {
     double delta = wl_fixed_to_double(value);
     if (delta == 0) return;
+
+    app.selecting = 0;
+    app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
 
     if (app.is_altscreen && app.mouse_reporting) {
         int col = (int)((app.mouse_x - app.padding_x) / app.font_width);
@@ -1136,6 +1247,9 @@ static void pointer_handle_axis_source(void *data, struct wl_pointer *pointer, u
 static void pointer_handle_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis) {}
 static void pointer_handle_axis_discrete(void *data, struct wl_pointer *pointer, uint32_t axis, int32_t discrete) {
     if (discrete == 0) return;
+
+    app.selecting = 0;
+    app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
 
     if (app.is_altscreen && app.mouse_reporting) {
         int col = (int)((app.mouse_x - app.padding_x) / app.font_width);
@@ -1217,42 +1331,16 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
                     const char *action = app.binds[i].actions[a];
                     if (strcmp(action, "copy") == 0) {
                         copy_selection_to_clipboard();
+                    } else if (strcmp(action, "paste") == 0) {
+                        paste_from_clipboard();
                     } else if (strcmp(action, "font_increase") == 0) {
                         change_font_size(1);
                     } else if (strcmp(action, "font_decrease") == 0) {
                         change_font_size(-1);
                     } else if (strcasecmp(action, "Return") == 0 || strcasecmp(action, "Enter") == 0) {
                         write(app.pty_master, "\r", 1);
-                    } else if (strncmp(action, "send:", 5) == 0) {
-                        const char *text_to_send = action + 5;
-                        char send_buf[128];
-                        int send_len = 0;
-                        for (int idx = 0; text_to_send[idx] != '\0' && send_len < (int)sizeof(send_buf) - 1; idx++) {
-                            if (text_to_send[idx] == '\\' && text_to_send[idx+1] == 'r') {
-                                send_buf[send_len++] = '\r';
-                                idx++;
-                            } else if (text_to_send[idx] == '\\' && text_to_send[idx+1] == 'n') {
-                                send_buf[send_len++] = '\n';
-                                idx++;
-                            } else {
-                                send_buf[send_len++] = text_to_send[idx];
-                            }
-                        }
-                        write(app.pty_master, send_buf, send_len);
-                    } else if (strlen(action) == 1) {
-                        write(app.pty_master, action, 1);
                     } else {
-                        pid_t pid = fork();
-                        if (pid == 0) {
-                            setsid(); 
-                            close(app.pty_master);
-                            if (app.display) wl_display_disconnect(app.display);
-
-                            execlp(app.shell, app.shell, "-c", action, NULL);
-                            _exit(127);
-                        } else if (pid > 0) {
-                            waitpid(pid, NULL, WNOHANG);
-                        }
+                        write(app.pty_master, action, strlen(action));
                     }
                 }
                 return;
@@ -1261,6 +1349,10 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
 
         if (ctrl_pressed && shift_pressed && (sym == XKB_KEY_c || sym == XKB_KEY_C)) {
             copy_selection_to_clipboard();
+            return;
+        }
+        if (ctrl_pressed && shift_pressed && (sym == XKB_KEY_v || sym == XKB_KEY_V)) {
+            paste_from_clipboard();
             return;
         }
 
@@ -1362,6 +1454,15 @@ static void seat_handle_capabilities(void *data, struct wl_seat *seat, uint32_t 
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !app.pointer) {
         app.pointer = wl_seat_get_pointer(seat);
         wl_pointer_add_listener(app.pointer, &pointer_listener, NULL);
+
+        app.cursor_theme = wl_cursor_theme_load(NULL, 24, app.shm);
+        if (app.cursor_theme) {
+            app.cursor_text = wl_cursor_theme_get_cursor(app.cursor_theme, "xterm");
+            if (!app.cursor_text) {
+                app.cursor_text = wl_cursor_theme_get_cursor(app.cursor_theme, "text");
+            }
+            app.cursor_default = wl_cursor_theme_get_cursor(app.cursor_theme, "left_ptr");
+        }
     }
 }
 
@@ -1409,6 +1510,15 @@ int main(int argc, char *argv[]) {
 
     setlocale(LC_ALL, "");
     load_config();
+
+    app.inotify_fd = inotify_init1(IN_NONBLOCK);
+    if (app.inotify_fd >= 0) {
+        char path[1024];
+        const char *home = getenv("HOME");
+        snprintf(path, sizeof(path), "%s/.config/l", home ? home : "/root");
+        mkdir(path, 0755);
+        app.inotify_wd = inotify_add_watch(app.inotify_fd, path, IN_CLOSE_WRITE | IN_MOVED_TO);
+    }
 
     app.width = DEFAULT_WIDTH;
     app.height = DEFAULT_HEIGHT;
@@ -1510,8 +1620,13 @@ int main(int argc, char *argv[]) {
         FD_ZERO(&fds);
         FD_SET(wl_fd, &fds);
         FD_SET(app.pty_master, &fds);
+        if (app.inotify_fd >= 0) {
+            FD_SET(app.inotify_fd, &fds);
+        }
 
-        int max_fd = (wl_fd > app.pty_master) ? wl_fd : app.pty_master;
+        int max_fd = wl_fd;
+        if (app.pty_master > max_fd) max_fd = app.pty_master;
+        if (app.inotify_fd >= 0 && app.inotify_fd > max_fd) max_fd = app.inotify_fd;
 
         struct timeval tv;
         tv.tv_sec = 0;
@@ -1520,6 +1635,24 @@ int main(int argc, char *argv[]) {
         if (select(max_fd + 1, &fds, NULL, NULL, &tv) < 0) {
             if (errno == EINTR) continue;
             break;
+        }
+
+        if (app.inotify_fd >= 0 && FD_ISSET(app.inotify_fd, &fds)) {
+            char event_buf[4096] __attribute__ ((aligned(__alignof__(struct inotify_event))));
+            ssize_t len = read(app.inotify_fd, event_buf, sizeof(event_buf));
+            if (len > 0) {
+                for (char *ptr = event_buf; ptr < event_buf + len; ) {
+                    struct inotify_event *event = (struct inotify_event *)ptr;
+                    if (event->len > 0 && strcmp(event->name, "config.json") == 0) {
+                        load_config();
+                        create_buffer();
+                        resize_pty();
+                        app.needs_render = 1;
+                        render();
+                    }
+                    ptr += sizeof(struct inotify_event) + event->len;
+                }
+            }
         }
 
         if (FD_ISSET(app.pty_master, &fds)) {
@@ -1536,9 +1669,14 @@ int main(int argc, char *argv[]) {
                 if (strstr(buf, "\033[?1049h") || strstr(buf, "\033[?47h") || strstr(buf, "\033[?1047h")) {
                     app.is_altscreen = 1;
                     app.scrollback_offset = 0;
+                    app.selecting = 0;
+                    app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
                 }
                 if (strstr(buf, "\033[?1049l") || strstr(buf, "\033[?47l") || strstr(buf, "\033[?1047l")) {
                     app.is_altscreen = 0;
+                    app.scrollback_offset = 0;
+                    app.selecting = 0;
+                    app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
                 }
 
                 vterm_input_write(app.vterm, buf, n);

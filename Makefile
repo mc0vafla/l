@@ -5,7 +5,7 @@ LIBS = $(shell pkg-config --libs wayland-client wayland-cursor xkbcommon cairo p
 
 XDG_SHELL_XML = /usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml
 
-all: src/xdg-shell-protocol.c src/xdg-shell-client-protocol.h l
+all: src/xdg-shell-protocol.c src/xdg-shell-client-protocol.h l-term
 
 src/xdg-shell-protocol.c:
 	mkdir -p src
@@ -15,7 +15,7 @@ src/xdg-shell-client-protocol.h:
 	mkdir -p src
 	wayland-scanner client-header $(XDG_SHELL_XML) src/xdg-shell-client-protocol.h
 
-l: src/main.c src/xdg-shell-protocol.c
+l-term: src/main.c src/xdg-shell-protocol.c
 	$(CC) $(CFLAGS) -o $@ src/main.c src/xdg-shell-protocol.c $(LIBS)
 
 clean:

@@ -12,6 +12,10 @@ Whats that binary? Its for x86 architecture, anyway this term takes around 1 sec
 
 Will it work on mac or anything besides linux+wayland? Probably no, i dont have mac to test it, idc about X11 users :kissing:.
 
+Where did i test it and where it ll 100% work totally fine? Artix, but ig any Arch based system ll be fine 100%. I guess l-term ll work on 90% of linux distros.
+
+Can i ask for some new features? Nah, if u want smth, do it by urself :smiling:.
+
 What are the features? Ehh, .json config in ur ~/.config/l/ folder, there s search on alt+/ aaand its very fast. Yea thats kinda it :p
 
 ## Screenshots

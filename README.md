@@ -16,6 +16,8 @@ Where did i test it and where it ll 100% work totally fine? Artix, but ig any Ar
 
 Can i ask for some new features? Nah, if u want smth, do it by urself :smile:.
 
+Why default config has so many strange keybinds? Because i decided to make it like that xd, u can always modify source code and remove anything u dont need.
+
 What are the features? Ehh, .json config in ur ~/.config/l/ folder, there s search on alt+/ aaand its very fast. Yea thats kinda it :p
 
 ## Screenshots

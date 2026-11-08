@@ -822,7 +822,7 @@ static void update_search_matches(void) {
     }
 
     int total_rows = app.scrollback_count + app.rows;
-    SearchMatch *temp_matches = malloc(sizeof(SearchMatch) * total_rows * app.cols);
+    SearchMatch *temp_matches = malloc(sizeof(SearchMatch) * total_rows);
     int count = 0;
 
     for (int r = 0; r < total_rows; r++) {
@@ -853,18 +853,15 @@ static void update_search_matches(void) {
         }
         line_chars[line_len] = '\0';
 
-        char *found = line_chars;
-        while (1) {
-            if (has_uppercase) {
-                found = strstr(found, app.search_query);
-            } else {
-                found = my_strcasestr(found, app.search_query);
-            }
+        char *found = NULL;
+        if (has_uppercase) {
+            found = strstr(line_chars, app.search_query);
+        } else {
+            found = my_strcasestr(line_chars, app.search_query);
+        }
 
-            if (!found) break;
-
+        if (found) {
             temp_matches[count++] = (SearchMatch){.row = r, .col = 0, .len = app.cols};
-            found += app.search_query_len;
         }
     }
 
@@ -1920,6 +1917,14 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             write(app.pty_master, multi_buf, 2);
             app.scrollback_offset = 0;
             app.needs_render = 1;
+
+            app.held_keycode = keycode;
+            app.held_bytes_len = 2;
+            memcpy(app.held_bytes, multi_buf, 2);
+            long long now = get_time_ms();
+            int delay = app.repeat_delay_ms > 0 ? app.repeat_delay_ms : 250;
+            app.next_repeat_time_ms = now + delay;
+            app.is_repeating = 0;
             return;
         }
 
@@ -2242,6 +2247,35 @@ int main(int argc, char *argv[]) {
                                 app.search_query[--app.search_query_len] = '\0';
                             }
                             update_search_matches();
+                        }
+                    } else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
+                        if (app.search_matches_count > 0) {
+                            int shift_pressed = app.xkb_state ? xkb_state_mod_name_is_active(app.xkb_state, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) : 0;
+                            if (shift_pressed) {
+                                app.search_current_match--;
+                                if (app.search_current_match < 0) app.search_current_match = app.search_matches_count - 1;
+                            } else {
+                                app.search_current_match++;
+                                if (app.search_current_match >= app.search_matches_count) app.search_current_match = 0;
+                            }
+
+                            SearchMatch *m = &app.search_matches[app.search_current_match];
+                            int target_virtual_row = m->row;
+                            int screen_row = target_virtual_row - app.scrollback_count;
+                            if (screen_row < 0) {
+                                app.scrollback_offset = -screen_row;
+                                if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
+                            } else {
+                                if (screen_row >= app.rows) {
+                                    int shift = screen_row - (app.rows - 1);
+                                    if (shift < 1) shift = 1;
+                                    app.scrollback_offset += shift;
+                                    if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
+                                } else {
+                                    app.scrollback_offset = 0;
+                                }
+                            }
+                            app.needs_render = 1;
                         }
                     } else if (app.held_bytes_len > 0 && !ctrl_pressed) {
                         if (app.search_query_len + app.held_bytes_len < (int)sizeof(app.search_query) - 1) {

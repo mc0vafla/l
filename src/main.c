@@ -169,7 +169,6 @@ static const struct wl_callback_listener frame_listener;
 static void update_search_matches(void);
 static void clear_full_history(void);
 
-/* Возвращаем родную единую палитру стиля */
 static const double default_palette[16][3] = {
     { 0x5c/255.0, 0x4b/255.0, 0x4b/255.0 },
     { 0xe6/255.0, 0x7e/255.0, 0x80/255.0 },
@@ -882,7 +881,18 @@ static void update_search_matches(void) {
             app.scrollback_offset = -screen_row;
             if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
         } else {
-            app.scrollback_offset = 0;
+            // Если матч находится на самой последней видимой строке (которая перекрывалась бы панелью поиска), 
+            // смещаем скролл на 1 строку вверх, чтобы текст поднялся и не перекрывался.
+            int render_rows = app.rows - 1;
+            if (render_rows < 1) render_rows = 1;
+            if (screen_row >= render_rows - 1) {
+                int shift = screen_row - (render_rows - 2);
+                if (shift < 1) shift = 1;
+                app.scrollback_offset += shift;
+                if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
+            } else {
+                app.scrollback_offset = 0;
+            }
         }
     }
     free(temp_matches);
@@ -1816,7 +1826,16 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
                         app.scrollback_offset = -screen_row;
                         if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
                     } else {
-                        app.scrollback_offset = 0;
+                        int render_rows = app.rows - 1;
+                        if (render_rows < 1) render_rows = 1;
+                        if (screen_row >= render_rows - 1) {
+                            int shift = screen_row - (render_rows - 2);
+                            if (shift < 1) shift = 1;
+                            app.scrollback_offset += shift;
+                            if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
+                        } else {
+                            app.scrollback_offset = 0;
+                        }
                     }
                     app.needs_render = 1;
                 }
@@ -2270,8 +2289,6 @@ int main(int argc, char *argv[]) {
                 if (strstr(buf, "\033[?1000l") || strstr(buf, "\033[?1002l") || strstr(buf, "\033[?1006l")) {
                     app.mouse_reporting = 0;
                 }
-
-                (void)write;
 
                 if (strstr(buf, "\033[?1049h") || strstr(buf, "\033[?47h") || strstr(buf, "\033[?1047h")) {
                     app.is_altscreen = 1;

@@ -1947,7 +1947,7 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             return;
         }
 
-if (ctrl_pressed && !alt_pressed && !shift_pressed && (sym == XKB_KEY_c || sym == XKB_KEY_C)) {
+        if (ctrl_pressed && !alt_pressed && !shift_pressed && (sym == XKB_KEY_c || sym == XKB_KEY_C)) {
             app.scrollback_offset = 0;
             
             if (app.is_altscreen) {
@@ -2015,11 +2015,21 @@ if (ctrl_pressed && !alt_pressed && !shift_pressed && (sym == XKB_KEY_c || sym =
             memcpy(buf, "\033[B", 3);
             len = 3;
         } else if (sym == XKB_KEY_Right) {
-            memcpy(buf, "\033[C", 3);
-            len = 3;
+            if (ctrl_pressed) {
+                memcpy(buf, "\033[1;5C", 6);
+                len = 6;
+            } else {
+                memcpy(buf, "\033[C", 3);
+                len = 3;
+            }
         } else if (sym == XKB_KEY_Left) {
-            memcpy(buf, "\033[D", 3);
-            len = 3;
+            if (ctrl_pressed) {
+                memcpy(buf, "\033[1;5D", 6);
+                len = 6;
+            } else {
+                memcpy(buf, "\033[D", 3);
+                len = 3;
+            }
         } else if (app.xkb_state) {
             len = xkb_state_key_get_utf8(app.xkb_state, keycode, buf, sizeof(buf));
         }

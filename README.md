@@ -20,6 +20,8 @@ Why default config has so many strange keybinds? Because i decided to make it li
 
 What are the features? Ehh, .json config in ur ~/.config/l/ folder, there s search on alt+/ aaand its very fast. Yea thats kinda it :p
 
+Is "ig" ur fav word? YES!
+
 ## Screenshots
 
 <img width="1343" height="1074" alt="image" src="https://github.com/user-attachments/assets/c3cad495-d13a-4764-849c-0985d52903ef" />

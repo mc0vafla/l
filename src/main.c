@@ -369,6 +369,8 @@ static void load_config(void) {
     app.cursor_shape = 0;
     memcpy(app.palette, default_palette, sizeof(default_palette));
 
+    // \n or \r (Enter), \t (Tab), \b (Backspace), \e (Escape)
+
     FILE *f = fopen(path, "r");
     if (!f) {
         system("mkdir -p ~/.config/l");

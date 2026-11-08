@@ -169,6 +169,7 @@ static const struct wl_callback_listener frame_listener;
 static void update_search_matches(void);
 static void clear_full_history(void);
 
+/* Возвращаем родную единую палитру стиля */
 static const double default_palette[16][3] = {
     { 0x5c/255.0, 0x4b/255.0, 0x4b/255.0 },
     { 0xe6/255.0, 0x7e/255.0, 0x80/255.0 },
@@ -177,7 +178,7 @@ static const double default_palette[16][3] = {
     { 0xe6/255.0, 0x80/255.0, 0xa0/255.0 },
     { 0xe6/255.0, 0x80/255.0, 0xc0/255.0 },
     { 0xe6/255.0, 0x80/255.0, 0x80/255.0 },
-    { 0xe6/255.0, 0xcc/255.0, 0xcc/255.0 },
+    { 0xd3/255.0, 0xc6/255.0, 0xaa/255.0 },
     { 0x72/255.0, 0x5c/255.0, 0x5c/255.0 },
     { 0xf0/255.0, 0x94/255.0, 0x96/255.0 },
     { 0xf0/255.0, 0xa2/255.0, 0x94/255.0 },
@@ -399,7 +400,6 @@ static void load_config(void) {
             fprintf(df, "  \"padding_x\": 6,\n");
             fprintf(df, "  \"padding_y\": 6,\n");
             fprintf(df, "  \"shell\": \"fish\",\n");
-            fprintf(df, "  // Available special escape sequences in actions: \\n or \\r (Enter), \\t (Tab), \\b (Backspace), \\e (Escape)\n");
             fprintf(df, "  \"binds\": [\n");
             fprintf(df, "    { \"key\": \"c\", \"mods\": \"ctrl+shift\", \"action\": \"copy\" },\n");
             fprintf(df, "    { \"key\": \"v\", \"mods\": \"ctrl+shift\", \"action\": \"paste\" },\n");
@@ -1051,7 +1051,7 @@ static void render(void) {
             double fh = (double)app.font_height;
 
             if (selected) {
-                cairo_set_source_rgba(app.cr, 0.8, 0.8, 0.8, 0.35);
+                cairo_set_source_rgba(app.cr, 0xe6/255.0, 0x80/255.0, 0xa0/255.0, 0.45);
                 cairo_rectangle(app.cr, x, y, fw, fh);
                 cairo_fill(app.cr);
             } else if (matched) {
@@ -1074,20 +1074,22 @@ static void render(void) {
 
                 if (matched) {
                     cairo_set_source_rgb(app.cr, bg_r, bg_g, bg_b);
-                } else if (selected || has_bg) {
-                    double lum = 0.299 * cr + 0.587 * cg + 0.114 * cb;
-                    double bg_lum = selected ? (0.299 * 0.8 + 0.587 * 0.8 + 0.114 * 0.8) : (0.299 * cbg_r + 0.587 * cbg_g + 0.114 * cbg_b);
-                    if (fabs(lum - bg_lum) < 0.25) {
-                        if (bg_lum > 0.5) {
-                            cairo_set_source_rgb(app.cr, 0.1, 0.1, 0.1);
-                        } else {
-                            cairo_set_source_rgb(app.cr, 0.9, 0.9, 0.9);
-                        }
+                } else if (selected) {
+                    cairo_set_source_rgb(app.cr, 1.0, 1.0, 1.0);
+                } else {
+                    // Умная мягкая защита: если цвет текста почти сливается с фоном ячейки, подтягиваем его к читаемому кремовому fg
+                    double effective_bg_r = has_bg ? cbg_r : bg_r;
+                    double effective_bg_g = has_bg ? cbg_g : bg_g;
+                    double effective_bg_b = has_bg ? cbg_b : bg_b;
+                    
+                    double diff = (cr - effective_bg_r)*(cr - effective_bg_r) + 
+                                  (cg - effective_bg_g)*(cg - effective_bg_g) + 
+                                  (cb - effective_bg_b)*(cb - effective_bg_b);
+                    if (diff < 0.05) {
+                        cairo_set_source_rgb(app.cr, default_fg_r, default_fg_g, default_fg_b);
                     } else {
                         cairo_set_source_rgb(app.cr, cr, cg, cb);
                     }
-                } else {
-                    cairo_set_source_rgb(app.cr, cr, cg, cb);
                 }
                 cairo_move_to(app.cr, x, y);
                 pango_layout_set_text(app.pango_layout, utf8, len);

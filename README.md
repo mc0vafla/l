@@ -18,7 +18,7 @@ Can i ask for some new features? Nah, if u want smth, do it by urself :smile:.
 
 Why default config has so many strange keybinds? Because i decided to make it like that xd, u can always modify source code and remove anything u dont need.
 
-What are the features? Ehh, .json config in ur ~/.config/l/ folder, there s search on alt+/ aaand its very fast. Yea thats kinda it :p
+What are the features? Ehh, .json config in ur ~/.config/l/ folder, scrollbar, search on alt+/ and its very fast. Yea thats kinda it :p
 
 Is "ig" ur fav word? YES!
 

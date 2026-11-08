@@ -23,5 +23,5 @@ Idk what else u expected to see here, its a terminal :)
 
 ```bash
 git clone https://github.com/mc0vafla/l.git
-cd mcrgn
+cd l
 make

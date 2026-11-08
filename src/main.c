@@ -15,6 +15,7 @@
 #include <termios.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <signal.h>
 #include <wayland-client.h>
 #include <wayland-cursor.h>
 #include <xkbcommon/xkbcommon.h>
@@ -1946,10 +1947,22 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             return;
         }
 
-        if (ctrl_pressed && !alt_pressed && !shift_pressed && (sym == XKB_KEY_c || sym == XKB_KEY_C)) {
+if (ctrl_pressed && !alt_pressed && !shift_pressed && (sym == XKB_KEY_c || sym == XKB_KEY_C)) {
             app.scrollback_offset = 0;
-            write(app.pty_master, "\x03", 1);
-            app.needs_render = 1;
+            
+            if (app.is_altscreen) {
+                write(app.pty_master, "\x03", 1);
+            } else {
+                pid_t fg_pgrp = tcgetpgrp(app.pty_master);
+                if (fg_pgrp > 1) {
+                    kill(-fg_pgrp, SIGINT);
+                } else if (app.pid > 0) {
+                    kill(-app.pid, SIGINT);
+                }
+                
+                write(app.pty_master, "\x03", 1);
+                app.needs_render = 1;
+            }
             return;
         }
 

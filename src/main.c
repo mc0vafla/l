@@ -1074,6 +1074,18 @@ static void render(void) {
 
                 if (matched) {
                     cairo_set_source_rgb(app.cr, bg_r, bg_g, bg_b);
+                } else if (selected || has_bg) {
+                    double lum = 0.299 * cr + 0.587 * cg + 0.114 * cb;
+                    double bg_lum = selected ? (0.299 * 0.8 + 0.587 * 0.8 + 0.114 * 0.8) : (0.299 * cbg_r + 0.587 * cbg_g + 0.114 * cbg_b);
+                    if (fabs(lum - bg_lum) < 0.25) {
+                        if (bg_lum > 0.5) {
+                            cairo_set_source_rgb(app.cr, 0.1, 0.1, 0.1);
+                        } else {
+                            cairo_set_source_rgb(app.cr, 0.9, 0.9, 0.9);
+                        }
+                    } else {
+                        cairo_set_source_rgb(app.cr, cr, cg, cb);
+                    }
                 } else {
                     cairo_set_source_rgb(app.cr, cr, cg, cb);
                 }

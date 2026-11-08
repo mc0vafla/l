@@ -881,12 +881,8 @@ static void update_search_matches(void) {
             app.scrollback_offset = -screen_row;
             if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
         } else {
-            // Если матч находится на самой последней видимой строке (которая перекрывалась бы панелью поиска), 
-            // смещаем скролл на 1 строку вверх, чтобы текст поднялся и не перекрывался.
-            int render_rows = app.rows - 1;
-            if (render_rows < 1) render_rows = 1;
-            if (screen_row >= render_rows - 1) {
-                int shift = screen_row - (render_rows - 2);
+            if (screen_row >= app.rows) {
+                int shift = screen_row - (app.rows - 1);
                 if (shift < 1) shift = 1;
                 app.scrollback_offset += shift;
                 if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
@@ -1012,15 +1008,9 @@ static void render(void) {
     double default_fg_g = ((app.fg_color >> 8) & 0xFF) / 255.0;
     double default_fg_b = (app.fg_color & 0xFF) / 255.0;
 
-    double panel_height = (double)app.font_height;
+    double panel_height = (double)(app.font_height * 2);
 
-    int render_rows = app.rows;
-    if (app.search_active && !app.is_altscreen) {
-        render_rows = app.rows - 1;
-        if (render_rows < 1) render_rows = 1;
-    }
-
-    for (int row = 0; row < render_rows; row++) {
+    for (int row = 0; row < app.rows; row++) {
         for (int col = 0; col < app.cols; col++) {
             VTermScreenCell cell;
             
@@ -1183,7 +1173,7 @@ static void render(void) {
         }
 
         cairo_set_source_rgb(app.cr, default_fg_r, default_fg_g, default_fg_b);
-        cairo_move_to(app.cr, (double)app.padding_x + 10.0, panel_y + 2.0);
+        cairo_move_to(app.cr, (double)app.padding_x + 10.0, panel_y + 4.0);
         pango_layout_set_text(app.pango_layout, panel_text, strlen(panel_text));
         pango_cairo_show_layout(app.cr, app.pango_layout);
 
@@ -1197,7 +1187,7 @@ static void render(void) {
         g_object_unref(layout_q);
 
         double cursor_x_pos = (double)app.padding_x + 10.0 + (double)query_width_px;
-        double cursor_y_pos = panel_y + 2.0;
+        double cursor_y_pos = panel_y + 4.0;
         double cursor_h = (double)app.font_height;
 
         double cursor_r = app.palette[1][0];
@@ -1345,6 +1335,24 @@ static void resize_pty(void) {
     ioctl(app.pty_master, TIOCSWINSZ, &ws);
 }
 
+static void update_terminal_size_for_search(void) {
+    int calc_rows = (app.height - (app.padding_y * 2)) / (app.font_height > 0 ? app.font_height : 16);
+
+    int new_rows = calc_rows < MIN_VTERM_ROWS ? MIN_VTERM_ROWS : calc_rows;
+    if (app.search_active && !app.is_altscreen) {
+        new_rows -= 2;
+        if (new_rows < 1) new_rows = 1;
+    }
+
+    if (new_rows != app.rows) {
+        app.rows = new_rows;
+        if (app.vterm) {
+            vterm_set_size(app.vterm, app.rows, app.cols);
+        }
+        resize_pty();
+    }
+}
+
 static void send_mouse_report(int button, int release, int col, int row) {
     if (!app.mouse_reporting) return;
 
@@ -1378,6 +1386,11 @@ static void change_font_size(int delta) {
 
     app.cols = calc_cols < MIN_VTERM_COLS ? MIN_VTERM_COLS : calc_cols;
     app.rows = calc_rows < MIN_VTERM_ROWS ? MIN_VTERM_ROWS : calc_rows;
+
+    if (app.search_active && !app.is_altscreen) {
+        app.rows -= 2;
+        if (app.rows < 1) app.rows = 1;
+    }
 
     if (app.vterm) {
         vterm_set_size(app.vterm, app.rows, app.cols);
@@ -1414,6 +1427,11 @@ static void xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *tople
 
     int new_cols = calc_cols < MIN_VTERM_COLS ? MIN_VTERM_COLS : calc_cols;
     int new_rows = calc_rows < MIN_VTERM_ROWS ? MIN_VTERM_ROWS : calc_rows;
+
+    if (app.search_active && !app.is_altscreen) {
+        new_rows -= 2;
+        if (new_rows < 1) new_rows = 1;
+    }
 
     if (new_cols != app.cols || new_rows != app.rows) {
         app.cols = new_cols;
@@ -1807,6 +1825,7 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
                     app.search_matches = NULL;
                 }
                 app.search_matches_count = 0;
+                update_terminal_size_for_search();
                 app.needs_render = 1;
                 return;
             } else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
@@ -1826,10 +1845,8 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
                         app.scrollback_offset = -screen_row;
                         if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
                     } else {
-                        int render_rows = app.rows - 1;
-                        if (render_rows < 1) render_rows = 1;
-                        if (screen_row >= render_rows - 1) {
-                            int shift = screen_row - (render_rows - 2);
+                        if (screen_row >= app.rows) {
+                            int shift = screen_row - (app.rows - 1);
                             if (shift < 1) shift = 1;
                             app.scrollback_offset += shift;
                             if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
@@ -1910,6 +1927,7 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             app.search_active = 1;
             app.search_query[0] = '\0';
             app.search_query_len = 0;
+            update_terminal_size_for_search();
             update_search_matches();
             return;
         }

@@ -2,7 +2,7 @@
 
 An incredibly fast Wayland terminal emulator built in C.
 
-I made it for myself so there are a lot of unchangable things, but i think u can try to simply give this code to ai and ask it to change smth u need.
+I made it for myself so there are a lot of unchangable things, but i think u can try to simply give this code to AI and ask it to change smth u need.
 
 Why its in 1 file? Because im too lazy for splitting and structuring it.
 

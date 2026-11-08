@@ -42,7 +42,9 @@
 
 typedef struct {
     xkb_keysym_t sym;
-    uint32_t modifiers;
+    int need_ctrl;
+    int need_shift;
+    int need_alt;
     char actions[MAX_ACTIONS_PER_BIND][256];
     int actions_count;
 } KeyBind;
@@ -165,6 +167,7 @@ static void copy_selection_to_clipboard(void);
 static void update_cursor_shape(uint32_t serial);
 static const struct wl_callback_listener frame_listener;
 static void update_search_matches(void);
+static void clear_full_history(void);
 
 static const double default_palette[16][3] = {
     { 0x5c/255.0, 0x4b/255.0, 0x4b/255.0 },
@@ -389,8 +392,8 @@ static void load_config(void) {
         FILE *df = fopen(path, "w");
         if (df) {
             fprintf(df, "{\n");
-            fprintf(df, "  \"font_family\": \"%s\",\n", DEFAULT_FONT_NAME);
-            fprintf(df, "  \"font_size\": %d,\n", DEFAULT_FONT_SIZE);
+            fprintf(df, "  \"font_family\": \"DepartureMono\",\n");
+            fprintf(df, "  \"font_size\": 12,\n");
             fprintf(df, "  \"bg_color\": \"#282828\",\n");
             fprintf(df, "  \"fg_color\": \"#d3c6aa\",\n");
             fprintf(df, "  \"padding_x\": 6,\n");
@@ -403,7 +406,18 @@ static void load_config(void) {
             fprintf(df, "    { \"key\": \"equal\", \"mods\": \"ctrl\", \"action\": \"font_increase\" },\n");
             fprintf(df, "    { \"key\": \"minus\", \"mods\": \"ctrl\", \"action\": \"font_decrease\" },\n");
             fprintf(df, "    { \"key\": \"x\", \"mods\": \"alt\", \"actions\": [\"u\", \"\\r\"] },\n");
-            fprintf(df, "    { \"key\": \"z\", \"mods\": \"alt\", \"actions\": [\"dell\", \"\\r\"] }\n");
+            fprintf(df, "    { \"key\": \"z\", \"mods\": \"alt\", \"actions\": [\"dell\", \"\\r\"] },\n");
+            fprintf(df, "    { \"key\": \"e\", \"mods\": \"alt\", \"actions\": [\"nvim ~/.config/nvim/lua/mappings.lua\\n\"] },\n");
+            fprintf(df, "    { \"key\": \"f\", \"mods\": \"alt\", \"actions\": [\"nvim ~/.config/fish/config.fish\\n\"] },\n");
+            fprintf(df, "    { \"key\": \"d\", \"mods\": \"alt\", \"actions\": [\"nvim ~/.config/l/config.json\\n\"] },\n");
+            fprintf(df, "    { \"key\": \"r\", \"mods\": \"alt\", \"actions\": [\"doas nvim /etc/pacman.d/mirrorlist\\n\"] },\n");
+            fprintf(df, "    { \"key\": \"d\", \"mods\": \"ctrl+alt\", \"actions\": [\"nvim ~/.config/tmux/tmux.conf\\n\"] },\n");
+            fprintf(df, "    { \"key\": \"d\", \"mods\": \"shift+alt\", \"actions\": [\"nvim ~/.config/niri/modules/keybinds.kdl\\n\"] },\n");
+            fprintf(df, "    { \"key\": \"a\", \"mods\": \"alt\", \"actions\": [\"upd-grub\\n\"] },\n");
+            fprintf(df, "    { \"key\": \"c\", \"mods\": \"alt\", \"actions\": [\"gss\\n\"] },\n");
+            fprintf(df, "    { \"key\": \"w\", \"mods\": \"alt\", \"actions\": [\"na\\n\"] },\n");
+            fprintf(df, "    { \"key\": \"f\", \"mods\": \"ctrl\", \"actions\": [\"tmux\\n\"] },\n");
+            fprintf(df, "    { \"key\": \"s\", \"mods\": \"alt\", \"actions\": [\"dua i\\n\"] }\n");
             fprintf(df, "  ]\n");
             fprintf(df, "}\n");
             fclose(df);
@@ -515,11 +529,13 @@ static void load_config(void) {
 
                         if (k_str && kb.actions_count > 0) {
                             kb.sym = xkb_keysym_from_name(k_str, XKB_KEYSYM_NO_FLAGS);
-                            kb.modifiers = 0;
+                            kb.need_ctrl = 0;
+                            kb.need_shift = 0;
+                            kb.need_alt = 0;
                             if (m_str) {
-                                if (strstr(m_str, "ctrl")) kb.modifiers |= 1;
-                                if (strstr(m_str, "shift")) kb.modifiers |= 2;
-                                if (strstr(m_str, "alt")) kb.modifiers |= 4;
+                                if (strstr(m_str, "ctrl")) kb.need_ctrl = 1;
+                                if (strstr(m_str, "shift")) kb.need_shift = 1;
+                                if (strstr(m_str, "alt")) kb.need_alt = 1;
                             }
                             app.binds[app.binds_count++] = kb;
                         }
@@ -1665,11 +1681,17 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
     }
 
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
-        int ctrl_pressed = app.xkb_state ? xkb_state_mod_name_is_active(app.xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) : 0;
-        int shift_pressed = app.xkb_state ? xkb_state_mod_name_is_active(app.xkb_state, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) : 0;
-        int alt_pressed = app.xkb_state ? xkb_state_mod_name_is_active(app.xkb_state, XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) : 0;
-        
-        uint32_t current_mods = (ctrl_pressed ? 1 : 0) | (shift_pressed ? 2 : 0) | (alt_pressed ? 4 : 0);
+        uint32_t mods_effective = xkb_state_serialize_mods(app.xkb_state, 
+            XKB_STATE_MODS_DEPRESSED | XKB_STATE_MODS_LATCHED | XKB_STATE_MODS_EFFECTIVE);
+
+        xkb_mod_index_t ctrl_idx = xkb_keymap_mod_get_index(app.xkb_keymap, XKB_MOD_NAME_CTRL);
+        xkb_mod_index_t alt_idx = xkb_keymap_mod_get_index(app.xkb_keymap, XKB_MOD_NAME_ALT);
+        xkb_mod_index_t shift_idx = xkb_keymap_mod_get_index(app.xkb_keymap, XKB_MOD_NAME_SHIFT);
+
+        int ctrl_pressed = (ctrl_idx != XKB_MOD_INVALID && (mods_effective & (1 << ctrl_idx))) ? 1 : 0;
+        int alt_pressed = (alt_idx != XKB_MOD_INVALID && (mods_effective & (1 << alt_idx))) ? 1 : 0;
+        int shift_pressed = (shift_idx != XKB_MOD_INVALID && (mods_effective & (1 << shift_idx))) ? 1 : 0;
+
         xkb_keysym_t sym = app.xkb_state ? xkb_state_key_get_one_sym(app.xkb_state, keycode) : XKB_KEY_NoSymbol;
 
         if (sym == XKB_KEY_Shift_L || sym == XKB_KEY_Shift_R ||
@@ -1689,17 +1711,15 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             return;
         }
 
-        xkb_keysym_t check_sym = sym;
-        if (check_sym >= XKB_KEY_V && check_sym <= XKB_KEY_Z) {
-            check_sym = tolower(check_sym);
-        }
+        xkb_keysym_t check_sym = xkb_keysym_to_lower(sym);
 
         for (int i = 0; i < app.binds_count; i++) {
-            xkb_keysym_t bind_sym = app.binds[i].sym;
-            if (bind_sym >= XKB_KEY_V && bind_sym <= XKB_KEY_Z) {
-                bind_sym = tolower(bind_sym);
-            }
-            if (bind_sym == check_sym && app.binds[i].modifiers == current_mods) {
+            xkb_keysym_t bind_sym = xkb_keysym_to_lower(app.binds[i].sym);
+            if (bind_sym == check_sym &&
+                app.binds[i].need_ctrl == ctrl_pressed &&
+                app.binds[i].need_shift == shift_pressed &&
+                app.binds[i].need_alt == alt_pressed) {
+                
                 if (app.active_bind_keycode == keycode) {
                     return;
                 }
@@ -1862,7 +1882,7 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             return;
         }
 
-        if (ctrl_pressed && !alt_pressed && !shift_pressed && (sym == XKB_KEY_l || sym == XKB_KEY_L)) {
+        if (ctrl_pressed && !alt_pressed && !shift_pressed && (sym == XKB_KEY_l || sym == XKB_KEY_L) && !app.is_altscreen) {
             clear_full_history();
             write(app.pty_master, "\x0c", 1);
             return;
@@ -2239,12 +2259,6 @@ int main(int argc, char *argv[]) {
                 }
 
                 (void)write;
-
-                if (strstr(buf, "\033[3J") || (strstr(buf, "\033[J") && !app.is_altscreen)) {
-                    if (strstr(buf, "3J") || (strstr(buf, "2J") && strstr(buf, "H"))) {
-                        clear_full_history();
-                    }
-                }
 
                 if (strstr(buf, "\033[?1049h") || strstr(buf, "\033[?47h") || strstr(buf, "\033[?1047h")) {
                     app.is_altscreen = 1;

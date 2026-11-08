@@ -10,7 +10,7 @@ Is there any point in moving from alacritty to this? Kinda, first of i dont like
 
 Whats that binary? Its for x86 architecture, anyway this term takes around 1 sec to build so :shrug:.
 
-Will it work on mac or anything besides linux+wayland? Probably no, i dont have mac to test it, idc about X11 users, :kissing:.
+Will it work on mac or anything besides linux+wayland? Probably no, i dont have mac to test it, idc about X11 users :kissing:.
 
 What are the features? Ehh, .json config in ur ~/.config/l/ folder, there s search on alt+/ aaand its very fast. Yea thats kinda it :p
 

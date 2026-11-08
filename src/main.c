@@ -247,8 +247,11 @@ static int get_cell_width(VTermScreenCell *cell) {
     if (!cell->chars[0] || cell->chars[0] == ' ' || cell->chars[0] == 0) return 1;
     uint32_t ch = cell->chars[0];
 
-    if ((ch >= 0xE000 && ch <= 0xF8FF) ||
-        (ch >= 0xF0000 && ch <= 0xFFFFD) ||
+    if (ch >= 0xE000 && ch <= 0xF8FF) {
+        return 1;
+    }
+
+    if ((ch >= 0xF0000 && ch <= 0xFFFFD) ||
         (ch >= 0x100000 && ch <= 0x10FFFD) ||
         (ch >= 0x2300 && ch <= 0x23FF) ||
         (ch >= 0x2B00 && ch <= 0x2BFF) ||

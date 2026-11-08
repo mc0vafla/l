@@ -227,26 +227,23 @@ static inline int ucs4_to_utf8(uint32_t ch, char *out) {
     return 1;
 }
 
-static inline int get_cell_str(VTermScreenCell *cell, char *out) {
-    int len = 0;
-    if (!cell->chars[0] || cell->chars[0] == 0) {
+static inline int get_cell_str(const VTermScreenCell *cell, char *out) {
+    if (!cell->chars[0]) {
         out[0] = ' ';
+        out[1] = '\0';
         return 1;
     }
+    int len = 0;
     for (int i = 0; i < VTERM_MAX_CHARS_PER_CELL && cell->chars[i]; i++) {
         len += ucs4_to_utf8(cell->chars[i], out + len);
-    }
-    if (len == 0) {
-        out[0] = ' ';
-        return 1;
     }
     out[len] = '\0';
     return len;
 }
 
-static inline int get_cell_width(VTermScreenCell *cell) {
-    if (!cell->chars[0] || cell->chars[0] == ' ' || cell->chars[0] == 0) return 1;
+static inline int get_cell_width(const VTermScreenCell *cell) {
     uint32_t ch = cell->chars[0];
+    if (!ch || ch == ' ') return 1;
     if (ch >= 0xE000 && ch <= 0xF8FF) return 1;
     if ((ch >= 0xF0000 && ch <= 0xFFFFD) ||
         (ch >= 0x100000 && ch <= 0x10FFFD) ||
@@ -285,13 +282,13 @@ static int pango_x_to_col(int target_row, double mouse_x_rel) {
     return app.cols - 1;
 }
 
-static inline int jsmntyeq(const char *json, jsmntok_t *tok, const char *s) {
+static inline int jsmntyeq(const char *json, const jsmntok_t *tok, const char *s) {
     return (tok->type == JSMN_STRING && (int)strlen(s) == tok->end - tok->start &&
             strncmp(json + tok->start, s, tok->end - tok->start) == 0);
 }
 
 static inline uint32_t parse_hex_color(const char *str) {
-    if (str[0] == '#') str++;
+    if (*str == '#') str++;
     return (uint32_t)strtol(str, NULL, 16);
 }
 
@@ -354,9 +351,9 @@ static void load_config(void) {
     const char *home = getenv("HOME");
     snprintf(path, sizeof(path), "%s/.config/l/config.json", home ? home : "/root");
 
-    if (app.font_family) { free(app.font_family); app.font_family = NULL; }
-    if (app.font_name) { free(app.font_name); app.font_name = NULL; }
-    if (app.shell) { free(app.shell); app.shell = NULL; }
+    free(app.font_family);
+    free(app.font_name);
+    free(app.shell);
 
     app.font_family = strdup(DEFAULT_FONT_NAME);
     app.font_size = DEFAULT_FONT_SIZE;
@@ -368,8 +365,6 @@ static void load_config(void) {
     app.binds_count = 0;
     app.cursor_shape = 0;
     memcpy(app.palette, default_palette, sizeof(default_palette));
-
-    // \n or \r (Enter), \t (Tab), \b (Backspace), \e (Escape)
 
     FILE *f = fopen(path, "r");
     if (!f) {
@@ -508,11 +503,17 @@ static void paste_from_clipboard(void) {
     FILE *pipe = popen("wl-paste -n", "r");
     if (!pipe) return;
     int in_alt = app.is_altscreen;
+
     if (in_alt) {
-        write(app.pty_master, "i", 1);
-        usleep(15000);
+        int is_nvim_insert = (app.cursor_shape == 2);
+        if (!is_nvim_insert) {
+            write(app.pty_master, "i", 1);
+            usleep(30000);
+        }
     }
-    write(app.pty_master, "\033[?2004h", 8);
+
+    write(app.pty_master, "\033[?2004h", 8); 
+    
     char clip_buf[4096];
     size_t n;
     while ((n = fread(clip_buf, 1, sizeof(clip_buf), pipe)) > 0) {
@@ -525,11 +526,9 @@ static void paste_from_clipboard(void) {
         }
     }
     pclose(pipe);
+    
     write(app.pty_master, "\033[?2004l", 8);
-    if (in_alt) {
-        usleep(15000);
-        write(app.pty_master, "\x1b", 1);
-    }
+
     app.scrollback_offset = 0;
     app.selecting = 0;
     app.sel_start_row = app.sel_end_row = app.sel_start_col = app.sel_end_col = 0;
@@ -587,7 +586,7 @@ static void create_buffer(void) {
     if (app.font_height <= 0) app.font_height = 16;
 }
 
-static inline void get_cell_colors(VTermScreenCell *cell, double default_r, double default_g, double default_b,
+static inline void get_cell_colors(const VTermScreenCell *cell, double default_r, double default_g, double default_b,
                                    double bg_r, double bg_g, double bg_b,
                                    double *out_r, double *out_g, double *out_b,
                                    double *out_bg_r, double *out_bg_g, double *out_bg_b, int *has_bg) {
@@ -660,7 +659,7 @@ static inline int is_cell_selected(int r, int c) {
 static inline int is_cell_matched(int virtual_row, int c, int *is_current) {
     if (!app.search_active || app.search_query_len == 0) return 0;
     for (int i = 0; i < app.search_matches_count; i++) {
-        SearchMatch *m = &app.search_matches[i];
+        const SearchMatch *m = &app.search_matches[i];
         if (m->row == virtual_row && c >= m->col && c < m->col + m->len) {
             if (is_current) *is_current = (i == app.search_current_match);
             return 1;
@@ -835,7 +834,7 @@ static void render(void) {
         int target_row = row - app.scrollback_offset;
         int virtual_row = app.scrollback_count + target_row;
         int sb_idx = (target_row < 0) ? (app.scrollback_head + target_row + SCROLLBACK_SIZE) % SCROLLBACK_SIZE : 0;
-        VTermScreenCell *sb_row = (target_row < 0) ? app.scrollback[sb_idx] : NULL;
+        const VTermScreenCell *sb_row = (target_row < 0) ? app.scrollback[sb_idx] : NULL;
 
         for (int col = 0; col < app.cols; col++) {
             VTermScreenCell cell;
@@ -855,7 +854,7 @@ static void render(void) {
             int selected = is_cell_selected(row, col);
             int is_current_match = 0;
             int matched = is_cell_matched(virtual_row, col, &is_current_match);
-            int has_char = (cell.chars[0] && cell.chars[0] != ' ' && cell.chars[0] != 0);
+            int has_char = (cell.chars[0] && cell.chars[0] != ' ');
 
             if (!has_char && !has_bg && !selected && !is_underline && !matched) continue;
 
@@ -935,7 +934,7 @@ static void render(void) {
         } else {
             cairo_rectangle(app.cr, cursor_x, cursor_y, fw, fh);
             cairo_fill(app.cr);
-            if (cursor_cell.chars[0] && cursor_cell.chars[0] != ' ' && cursor_cell.chars[0] != 0) {
+            if (cursor_cell.chars[0] && cursor_cell.chars[0] != ' ') {
                 char ch_buf[16] = {0};
                 int ch_len = get_cell_str(&cursor_cell, ch_buf);
                 cairo_set_source_rgb(app.cr, bg_r, bg_g, bg_b);
@@ -1455,7 +1454,8 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
                 app.search_active = 0;
                 app.search_query[0] = '\0';
                 app.search_query_len = 0;
-                if (app.search_matches) { free(app.search_matches); app.search_matches = NULL; }
+                free(app.search_matches);
+                app.search_matches = NULL;
                 app.search_matches_count = 0;
                 update_terminal_size_for_search();
                 app.needs_render = 1;

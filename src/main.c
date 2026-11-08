@@ -1077,7 +1077,6 @@ static void render(void) {
                 } else if (selected) {
                     cairo_set_source_rgb(app.cr, 1.0, 1.0, 1.0);
                 } else {
-                    // Умная мягкая защита: если цвет текста почти сливается с фоном ячейки, подтягиваем его к читаемому кремовому fg
                     double effective_bg_r = has_bg ? cbg_r : bg_r;
                     double effective_bg_g = has_bg ? cbg_g : bg_g;
                     double effective_bg_b = has_bg ? cbg_b : bg_b;

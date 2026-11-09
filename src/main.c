@@ -445,7 +445,7 @@ static void load_config(void) {
         system("mkdir -p ~/.config/l");
         FILE *df = fopen(path, "w");
         if (df) {
-            fprintf(df, "{\n  \"font_family\": \"DepartureMono\",\n  \"font_size\": 12,\n  \"bg_color\": \"#282828\",\n  \"fg_color\": \"#d3c6aa\",\n  \"padding_x\": 6,\n  \"padding_y\": 6,\n  \"shell\": \"fish\",\n  \"binds\": [\n    { \"key\": \"v\", \"mods\": \"ctrl+shift\", \"action\": \"paste\" },\n    { \"key\": \"equal\", \"mods\": \"ctrl\", \"action\": \"font_increase\" },\n    { \"key\": \"minus\", \"mods\": \"ctrl\", \"action\": \"font_decrease\" }\n  ]\n}\n");
+            fprintf(df, "{\n  \"font_family\": \"DepartureMono\",\n  \"font_size\": 12,\n  \"bg_color\": \"#282828\",\n  \"fg_color\": \"#d3c6aa\",\n  \"padding_x\": 6,\n  \"padding_y\": 6,\n  \"shell\": \"fish\",\n  \"binds\": [\n    { \"key\": \"equal\", \"mods\": \"ctrl\", \"action\": \"font_increase\" },\n    { \"key\": \"minus\", \"mods\": \"ctrl\", \"action\": \"font_decrease\" }\n  ]\n}\n");
             fclose(df);
         }
         f = fopen(path, "r");
@@ -571,40 +571,6 @@ static void load_config(void) {
     snprintf(full_font, sizeof(full_font), "%s %d", app.font_family, app.font_size);
     app.font_name = strdup(full_font);
     free(buf);
-}
-
-static void paste_from_clipboard(void) {
-    FILE *pipe = popen("wl-paste -n", "r");
-    if (!pipe) return;
-    int in_alt = app.is_altscreen;
-
-    if (in_alt) {
-        int is_nvim_insert = (app.cursor_shape == 2);
-        if (!is_nvim_insert) {
-            write(app.pty_master, "i", 1);
-            usleep(15000);
-        }
-    }
-
-    write(app.pty_master, "\033[?2004h", 8); 
-    
-    char clip_buf[4096];
-    size_t n;
-    while ((n = fread(clip_buf, 1, sizeof(clip_buf), pipe)) > 0) {
-        for (size_t i = 0; i < n; i++) {
-            if (clip_buf[i] == '\n' && !in_alt) {
-                write(app.pty_master, "\\\n", 2);
-            } else {
-                write(app.pty_master, &clip_buf[i], 1);
-            }
-        }
-    }
-    pclose(pipe);
-    
-    write(app.pty_master, "\033[?2004l", 8);
-
-    app.scrollback_offset = 0;
-    app.needs_render = 1;
 }
 
 static int create_shm_file(off_t size) {
@@ -1217,6 +1183,21 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
         if (sym == XKB_KEY_Shift_L || sym == XKB_KEY_Shift_R || sym == XKB_KEY_Control_L || sym == XKB_KEY_Control_R ||
             sym == XKB_KEY_Alt_L || sym == XKB_KEY_Alt_R || sym == XKB_KEY_Super_L || sym == XKB_KEY_Super_R) return;
 
+        if (ctrl && shift && !alt && (sym == XKB_KEY_v || sym == XKB_KEY_V)) {
+            if (!app.is_altscreen && app.scrollback_offset == 0) {
+                FILE *fp = popen("wl-paste -n 2>/dev/null", "r");
+                if (fp) {
+                    char clip_buf[4096];
+                    size_t len;
+                    while ((len = fread(clip_buf, 1, sizeof(clip_buf), fp)) > 0) {
+                        write(app.pty_master, clip_buf, len);
+                    }
+                    pclose(fp);
+                }
+                return;
+            }
+        }
+
         if (alt && !ctrl && !shift && (sym == XKB_KEY_v || sym == XKB_KEY_V)) {
             if (!app.is_altscreen && app.scrollback_offset == 0) {
                 pid_t fg_pgrp = tcgetpgrp(app.pty_master);
@@ -1226,8 +1207,6 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
                 }
             }
         }
-
-        if (ctrl && shift && (sym == XKB_KEY_v || sym == XKB_KEY_V)) { paste_from_clipboard(); return; }
 
         xkb_keysym_t check_sym = xkb_keysym_to_lower(sym);
         for (int i = 0; i < app.binds_count; i++) {
@@ -1240,8 +1219,7 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
 
                 for (int a = 0; a < app.binds[i].actions_count; a++) {
                     const char *action = app.binds[i].actions[a];
-                    if (strcmp(action, "paste") == 0) paste_from_clipboard();
-                    else if (strcmp(action, "font_increase") == 0) change_font_size(1);
+                    if (strcmp(action, "font_increase") == 0) change_font_size(1);
                     else if (strcmp(action, "font_decrease") == 0) change_font_size(-1);
                     else if (strcasecmp(action, "Return") == 0 || strcasecmp(action, "Enter") == 0) write(app.pty_master, "\r", 1);
                     else {

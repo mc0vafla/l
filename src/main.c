@@ -1183,24 +1183,6 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             return;
         }
 
-        if (ctrl && shift && !alt && (sym == XKB_KEY_v || sym == XKB_KEY_V)) {
-            if (!app.is_altscreen) {
-                pid_t fg_pgrp = tcgetpgrp(app.pty_master);
-                if (fg_pgrp <= 0 || fg_pgrp == app.pid || fg_pgrp == tcgetpgrp(STDIN_FILENO)) {
-                    FILE *fp = popen("wl-paste -n 2>/dev/null", "r");
-                    if (fp) {
-                        char clip_buf[4096];
-                        size_t len;
-                        while ((len = fread(clip_buf, 1, sizeof(clip_buf), fp)) > 0) {
-                            write(app.pty_master, clip_buf, len);
-                        }
-                        pclose(fp);
-                    }
-                    return; 
-                }
-            }
-        }
-
         xkb_keysym_t check_sym = xkb_keysym_to_lower(sym);
         for (int i = 0; i < app.binds_count; i++) {
             if (xkb_keysym_to_lower(app.binds[i].sym) == check_sym &&

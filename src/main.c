@@ -1096,6 +1096,93 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
         if (sym == XKB_KEY_Shift_L || sym == XKB_KEY_Shift_R || sym == XKB_KEY_Control_L || sym == XKB_KEY_Control_R ||
             sym == XKB_KEY_Alt_L || sym == XKB_KEY_Alt_R || sym == XKB_KEY_Super_L || sym == XKB_KEY_Super_R) return;
 
+        if (alt && !ctrl && !shift && (sym == XKB_KEY_v || sym == XKB_KEY_V)) {
+            char dump_path[] = "/tmp/l-term-history-XXXXXX";
+            int dump_fd = mkstemp(dump_path);
+            if (dump_fd >= 0) {
+                int total_lines = 0;
+                int max_lines = 65536;
+                char **lines = malloc(sizeof(char*) * max_lines);
+                
+                if (app.scrollback_fd >= 0 && app.scrollback_count > 0) {
+                    VTermScreenCell *row_cells = malloc(sizeof(VTermScreenCell) * app.cols);
+                    if (row_cells) {
+                        for (int i = 0; i < app.scrollback_count && total_lines < max_lines; i++) {
+                            get_scrollback_line(i, row_cells);
+                            char line_buf[4096];
+                            int line_len = 0;
+                            for (int c = 0; c < app.cols; c++) {
+                                char utf8[16] = {0};
+                                int len = get_cell_str(&row_cells[c], utf8);
+                                if (line_len + len < (int)sizeof(line_buf)) {
+                                    memcpy(line_buf + line_len, utf8, len);
+                                    line_len += len;
+                                }
+                            }
+                            while (line_len > 0 && (line_buf[line_len - 1] == ' ' || line_buf[line_len - 1] == '\t')) {
+                                line_len--;
+                            }
+                            line_buf[line_len] = '\0';
+                            lines[total_lines++] = strdup(line_buf);
+                        }
+                        free(row_cells);
+                    }
+                }
+
+                VTermScreenCell *row_cells = malloc(sizeof(VTermScreenCell) * app.cols);
+                if (row_cells) {
+                    for (int r = 0; r < app.rows && total_lines < max_lines; r++) {
+                        char line_buf[4096];
+                        int line_len = 0;
+                        for (int c = 0; c < app.cols; c++) {
+                            VTermScreenCell cell;
+                            vterm_screen_get_cell(app.vtscreen, (VTermPos){r, c}, &cell);
+                            char utf8[16] = {0};
+                            int len = get_cell_str(&cell, utf8);
+                            if (line_len + len < (int)sizeof(line_buf)) {
+                                memcpy(line_buf + line_len, utf8, len);
+                                line_len += len;
+                            }
+                        }
+                        while (line_len > 0 && (line_buf[line_len - 1] == ' ' || line_buf[line_len - 1] == '\t')) {
+                            line_len--;
+                        }
+                        line_buf[line_len] = '\0';
+                        lines[total_lines++] = strdup(line_buf);
+                    }
+                    free(row_cells);
+                }
+
+                while (total_lines > 0) {
+                    int empty = 1;
+                    for (int i = 0; lines[total_lines - 1][i] != '\0'; i++) {
+                        if (!isspace((unsigned char)lines[total_lines - 1][i])) {
+                            empty = 0;
+                            break;
+                        }
+                    }
+                    if (empty) {
+                        free(lines[total_lines - 1]);
+                        total_lines--;
+                    } else {
+                        break;
+                    }
+                }
+
+                for (int i = 0; i < total_lines; i++) {
+                    dprintf(dump_fd, "%s\n", lines[i]);
+                    free(lines[i]);
+                }
+                free(lines);
+                close(dump_fd);
+
+                char cmd[512];
+                snprintf(cmd, sizeof(cmd), "\x15nvim + %s; rm -f %s\r", dump_path, dump_path);
+                write(app.pty_master, cmd, strlen(cmd));
+            }
+            return;
+        }
+
         if (ctrl && shift && !alt && (sym == XKB_KEY_v || sym == XKB_KEY_V)) {
             if (!app.is_altscreen) {
                 pid_t fg_pgrp = tcgetpgrp(app.pty_master);

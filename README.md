@@ -1,6 +1,6 @@
 # l-term
 
-An incredibly fast Wayland terminal emulator built in C.
+An incredibly fast Wayland terminal built in C.
 
 Why its in 1 file? Because im too lazy for splitting and structuring it.
 

@@ -146,7 +146,6 @@ static void resize_pty(void);
 static void update_cursor_shape(uint32_t serial);
 static const struct wl_callback_listener frame_listener;
 static void clear_full_history(void);
-static void open_scrollback_in_vim(void);
 
 static const double default_palette[16][3] = {
     { 0x5c/255.0, 0x4b/255.0, 0x4b/255.0 },
@@ -331,92 +330,6 @@ static void clear_full_history(void) {
     app.scrollback_count = 0;
     app.scrollback_offset = 0;
     if (app.vtscreen) vterm_screen_reset(app.vtscreen, 1);
-    app.needs_render = 1;
-}
-
-static void open_scrollback_in_vim(void) {
-    char dump_path[128];
-    snprintf(dump_path, sizeof(dump_path), "/tmp/l-term-dump-%d.txt", getpid());
-    
-    int total_lines = app.scrollback_count + app.rows;
-    char **lines = malloc(sizeof(char *) * total_lines);
-    if (!lines) return;
-    int valid_lines_count = 0;
-
-    VTermScreenCell *row_cells = malloc(sizeof(VTermScreenCell) * app.cols);
-    if (row_cells) {
-        for (int i = 0; i < total_lines; i++) {
-            VTermScreenCell *cells_ptr = row_cells;
-            if (i < app.scrollback_count) {
-                get_scrollback_line(i, row_cells);
-            } else {
-                int r = i - app.scrollback_count;
-                for (int c = 0; c < app.cols; c++) {
-                    vterm_screen_get_cell(app.vtscreen, (VTermPos){r, c}, &row_cells[c]);
-                }
-            }
-
-            char line_buf[4096] = {0};
-            int line_len = 0;
-            for (int c = 0; c < app.cols; c++) {
-                char utf8[16] = {0};
-                int w = get_cell_str(&cells_ptr[c], utf8);
-                if (line_len + w < (int)sizeof(line_buf) - 1) {
-                    memcpy(line_buf + line_len, utf8, w);
-                    line_len += w;
-                }
-            }
-            while (line_len > 0) {
-                unsigned char last_char = (unsigned char)line_buf[line_len - 1];
-                if (last_char == ' ' || last_char == '\r' || last_char == '\t') {
-                    line_len--;
-                } else if (last_char >= 0x80) {
-                    int utf8_start = line_len - 1;
-                    while (utf8_start > 0 && ((unsigned char)line_buf[utf8_start] & 0xC0) == 0x80) {
-                        utf8_start--;
-                    }
-                    char u_buf[16] = {0};
-                    int u_len = line_len - utf8_start;
-                    if (u_len > 0 && u_len < (int)sizeof(u_buf)) {
-                        memcpy(u_buf, line_buf + utf8_start, u_len);
-                        if (strcmp(u_buf, " ") == 0 || strcmp(u_buf, " ") == 0) {
-                            line_len = utf8_start;
-                            continue;
-                        }
-                    }
-                    break;
-                } else {
-                    break;
-                }
-            }
-            line_buf[line_len] = '\0';
-
-            lines[i] = strdup(line_buf);
-            if (line_len > 0) {
-                valid_lines_count = i + 1;
-            }
-        }
-        free(row_cells);
-    }
-
-    int dump_fd = open(dump_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
-    if (dump_fd >= 0) {
-        for (int i = 0; i < valid_lines_count; i++) {
-            write(dump_fd, lines[i], strlen(lines[i]));
-            write(dump_fd, "\n", 1);
-        }
-        close(dump_fd);
-    }
-
-    for (int i = 0; i < total_lines; i++) {
-        free(lines[i]);
-    }
-    free(lines);
-
-    char cmd[512];
-    snprintf(cmd, sizeof(cmd), "\x03\x15nvim -c \"normal! G\" '%s'; rm -f '%s'\n\033[1A\033[2K", dump_path, dump_path);
-    write(app.pty_master, cmd, strlen(cmd));
-    app.scrollback_offset = 0;
     app.needs_render = 1;
 }
 
@@ -1184,26 +1097,19 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             sym == XKB_KEY_Alt_L || sym == XKB_KEY_Alt_R || sym == XKB_KEY_Super_L || sym == XKB_KEY_Super_R) return;
 
         if (ctrl && shift && !alt && (sym == XKB_KEY_v || sym == XKB_KEY_V)) {
-            if (!app.is_altscreen && app.scrollback_offset == 0) {
-                FILE *fp = popen("wl-paste -n 2>/dev/null", "r");
-                if (fp) {
-                    char clip_buf[4096];
-                    size_t len;
-                    while ((len = fread(clip_buf, 1, sizeof(clip_buf), fp)) > 0) {
-                        write(app.pty_master, clip_buf, len);
-                    }
-                    pclose(fp);
-                }
-                return;
-            }
-        }
-
-        if (alt && !ctrl && !shift && (sym == XKB_KEY_v || sym == XKB_KEY_V)) {
-            if (!app.is_altscreen && app.scrollback_offset == 0) {
+            if (!app.is_altscreen) {
                 pid_t fg_pgrp = tcgetpgrp(app.pty_master);
                 if (fg_pgrp <= 0 || fg_pgrp == app.pid || fg_pgrp == tcgetpgrp(STDIN_FILENO)) {
-                    open_scrollback_in_vim();
-                    return;
+                    FILE *fp = popen("wl-paste -n 2>/dev/null", "r");
+                    if (fp) {
+                        char clip_buf[4096];
+                        size_t len;
+                        while ((len = fread(clip_buf, 1, sizeof(clip_buf), fp)) > 0) {
+                            write(app.pty_master, clip_buf, len);
+                        }
+                        pclose(fp);
+                    }
+                    return; 
                 }
             }
         }
@@ -1563,6 +1469,7 @@ int main(int argc, char *argv[]) {
             if (n > 0) {
                 if (strstr(buf, "\033[?1000h") || strstr(buf, "\033[?1002h") || strstr(buf, "\033[?1006h")) app.mouse_reporting = 1;
                 if (strstr(buf, "\033[?1000l") || strstr(buf, "\033[?1002l") || strstr(buf, "\033[?1006l")) app.mouse_reporting = 0;
+                
                 if (strstr(buf, "\033[?1049h") || strstr(buf, "\033[?47h") || strstr(buf, "\033[?1047h")) {
                     app.is_altscreen = 1;
                     app.scrollback_offset = 0;

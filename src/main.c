@@ -38,7 +38,6 @@
 #define MIN_VTERM_COLS       80
 #define MIN_VTERM_ROWS       24
 
-#define SCROLLBACK_SIZE      1000
 #define SCROLLBAR_WIDTH      6
 
 typedef struct {
@@ -49,12 +48,6 @@ typedef struct {
     char actions[MAX_ACTIONS_PER_BIND][256];
     int actions_count;
 } KeyBind;
-
-typedef struct {
-    int row;
-    int col;
-    int len;
-} SearchMatch;
 
 typedef struct {
     struct wl_display *display;
@@ -116,8 +109,8 @@ typedef struct {
 
     double mouse_x, mouse_y;
 
-    VTermScreenCell *scrollback[SCROLLBACK_SIZE];
-    int scrollback_head;
+    int scrollback_fd;
+    char scrollback_path[128];
     int scrollback_count;
     int scrollback_offset;
 
@@ -142,13 +135,6 @@ typedef struct {
 
     int inotify_fd;
     int inotify_wd;
-
-    int search_active;
-    char search_query[256];
-    int search_query_len;
-    SearchMatch *search_matches;
-    int search_matches_count;
-    int search_current_match;
 } Term;
 
 static Term app = {0};
@@ -160,8 +146,8 @@ static void resize_pty(void);
 static void copy_selection_to_clipboard(void);
 static void update_cursor_shape(uint32_t serial);
 static const struct wl_callback_listener frame_listener;
-static void update_search_matches(void);
 static void clear_full_history(void);
+static void open_scrollback_in_vim(void);
 
 static const double default_palette[16][3] = {
     { 0x5c/255.0, 0x4b/255.0, 0x4b/255.0 },
@@ -249,29 +235,44 @@ static inline int get_cell_width(const VTermScreenCell *cell) {
     return 1;
 }
 
+static void get_scrollback_line(int line_idx, VTermScreenCell *cells_out) {
+    for (int c = 0; c < app.cols; c++) {
+        cells_out[c].chars[0] = ' ';
+        cells_out[c].chars[1] = 0;
+        cells_out[c].fg.type = VTERM_COLOR_INDEXED;
+        cells_out[c].fg.indexed.idx = 7;
+        cells_out[c].bg.type = VTERM_COLOR_INDEXED;
+        cells_out[c].bg.indexed.idx = 0;
+    }
+    if (app.scrollback_fd < 0 || line_idx < 0 || line_idx >= app.scrollback_count) return;
+    off_t offset = (off_t)line_idx * (app.cols * sizeof(VTermScreenCell));
+    pread(app.scrollback_fd, cells_out, app.cols * sizeof(VTermScreenCell), offset);
+}
+
 static int pango_x_to_col(int target_row, double mouse_x_rel) {
     if (target_row < 0 || target_row >= app.rows) return 0;
     double current_x = 0;
+    VTermScreenCell *row_cells = malloc(sizeof(VTermScreenCell) * app.cols);
     for (int c = 0; c < app.cols; c++) {
         VTermScreenCell cell;
         int virtual_target = target_row - app.scrollback_offset;
         if (virtual_target < 0) {
-            int sb_idx = (app.scrollback_head + virtual_target + SCROLLBACK_SIZE) % SCROLLBACK_SIZE;
-            if (app.scrollback[sb_idx]) {
-                cell = app.scrollback[sb_idx][c];
-            } else {
-                memset(&cell, 0, sizeof(cell));
-                cell.chars[0] = ' ';
-            }
+            int sb_idx = app.scrollback_count + virtual_target;
+            get_scrollback_line(sb_idx, row_cells);
+            cell = row_cells[c];
         } else {
             vterm_screen_get_cell(app.vtscreen, (VTermPos){virtual_target, c}, &cell);
         }
         int cell_w = get_cell_width(&cell);
         double next_x = current_x + (app.font_width * cell_w);
-        if (mouse_x_rel >= current_x && mouse_x_rel < next_x) return c;
+        if (mouse_x_rel >= current_x && mouse_x_rel < next_x) {
+            free(row_cells);
+            return c;
+        }
         current_x = next_x;
         if (current_x > app.width) break;
     }
+    free(row_cells);
     return app.cols - 1;
 }
 
@@ -324,16 +325,98 @@ static void strip_json_comments(char *buf) {
 }
 
 static void clear_full_history(void) {
-    for (int i = 0; i < SCROLLBACK_SIZE; i++) {
-        if (app.scrollback[i]) {
-            free(app.scrollback[i]);
-            app.scrollback[i] = NULL;
-        }
+    if (app.scrollback_fd >= 1) {
+        ftruncate(app.scrollback_fd, 0);
     }
-    app.scrollback_head = 0;
     app.scrollback_count = 0;
     app.scrollback_offset = 0;
     if (app.vtscreen) vterm_screen_reset(app.vtscreen, 1);
+    app.needs_render = 1;
+}
+
+static void open_scrollback_in_vim(void) {
+    char dump_path[128];
+    snprintf(dump_path, sizeof(dump_path), "/tmp/l-term-dump-%d.txt", getpid());
+    
+    int total_lines = app.scrollback_count + app.rows;
+    char **lines = malloc(sizeof(char *) * total_lines);
+    if (!lines) return;
+    int valid_lines_count = 0;
+
+    VTermScreenCell *row_cells = malloc(sizeof(VTermScreenCell) * app.cols);
+    if (row_cells) {
+        for (int i = 0; i < total_lines; i++) {
+            VTermScreenCell *cells_ptr = row_cells;
+            if (i < app.scrollback_count) {
+                get_scrollback_line(i, row_cells);
+            } else {
+                int r = i - app.scrollback_count;
+                for (int c = 0; c < app.cols; c++) {
+                    vterm_screen_get_cell(app.vtscreen, (VTermPos){r, c}, &row_cells[c]);
+                }
+            }
+
+            char line_buf[4096] = {0};
+            int line_len = 0;
+            for (int c = 0; c < app.cols; c++) {
+                char utf8[16] = {0};
+                int w = get_cell_str(&cells_ptr[c], utf8);
+                if (line_len + w < (int)sizeof(line_buf) - 1) {
+                    memcpy(line_buf + line_len, utf8, w);
+                    line_len += w;
+                }
+            }
+            while (line_len > 0) {
+                unsigned char last_char = (unsigned char)line_buf[line_len - 1];
+                if (last_char == ' ' || last_char == '\r' || last_char == '\t') {
+                    line_len--;
+                } else if (last_char >= 0x80) {
+                    int utf8_start = line_len - 1;
+                    while (utf8_start > 0 && ((unsigned char)line_buf[utf8_start] & 0xC0) == 0x80) {
+                        utf8_start--;
+                    }
+                    char u_buf[16] = {0};
+                    int u_len = line_len - utf8_start;
+                    if (u_len > 0 && u_len < (int)sizeof(u_buf)) {
+                        memcpy(u_buf, line_buf + utf8_start, u_len);
+                        if (strcmp(u_buf, " ") == 0 || strcmp(u_buf, " ") == 0) {
+                            line_len = utf8_start;
+                            continue;
+                        }
+                    }
+                    break;
+                } else {
+                    break;
+                }
+            }
+            line_buf[line_len] = '\0';
+
+            lines[i] = strdup(line_buf);
+            if (line_len > 0) {
+                valid_lines_count = i + 1;
+            }
+        }
+        free(row_cells);
+    }
+
+    int dump_fd = open(dump_path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+    if (dump_fd >= 0) {
+        for (int i = 0; i < valid_lines_count; i++) {
+            write(dump_fd, lines[i], strlen(lines[i]));
+            write(dump_fd, "\n", 1);
+        }
+        close(dump_fd);
+    }
+
+    for (int i = 0; i < total_lines; i++) {
+        free(lines[i]);
+    }
+    free(lines);
+
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "\x03\x15nvim -c \"normal! G\" '%s'; rm -f '%s'\n\033[1A\033[2K", dump_path, dump_path);
+    write(app.pty_master, cmd, strlen(cmd));
+    app.scrollback_offset = 0;
     app.needs_render = 1;
 }
 
@@ -627,93 +710,6 @@ static inline void get_cell_colors(const VTermScreenCell *cell, double default_r
     *has_bg = custom_bg;
 }
 
-static inline int is_cell_matched(int virtual_row, int c, int *is_current) {
-    if (!app.search_active || app.search_query_len == 0) return 0;
-    for (int i = 0; i < app.search_matches_count; i++) {
-        const SearchMatch *m = &app.search_matches[i];
-        if (m->row == virtual_row && c >= m->col && c < m->col + m->len) {
-            if (is_current) *is_current = (i == app.search_current_match);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static char* my_strcasestr(const char *haystack, const char *needle) {
-    if (!*needle) return (char *)haystack;
-    for (; *haystack; haystack++) {
-        const char *h = haystack, *n = needle;
-        while (*h && *n && (tolower((unsigned char)*h) == tolower((unsigned char)*n))) { h++; n++; }
-        if (!*n) return (char *)haystack;
-    }
-    return NULL;
-}
-
-static void update_search_matches(void) {
-    if (app.search_matches) { free(app.search_matches); app.search_matches = NULL; }
-    app.search_matches_count = 0;
-    app.search_current_match = -1;
-    if (!app.search_active || app.search_query_len == 0 || app.is_altscreen) {
-        app.needs_render = 1;
-        return;
-    }
-    int has_uppercase = 0;
-    for (int i = 0; i < app.search_query_len; i++) {
-        if (isupper((unsigned char)app.search_query[i])) { has_uppercase = 1; break; }
-    }
-    int total_rows = app.scrollback_count + app.rows;
-    SearchMatch *temp_matches = malloc(sizeof(SearchMatch) * total_rows);
-    if (!temp_matches) return;
-    int count = 0;
-    for (int r = 0; r < total_rows; r++) {
-        char line_chars[2048] = {0};
-        int line_len = 0;
-        for (int c = 0; c < app.cols; c++) {
-            VTermScreenCell cell;
-            int target_row = r - app.scrollback_count;
-            if (target_row < 0) {
-                int sb_idx = (app.scrollback_head + target_row + SCROLLBACK_SIZE) % SCROLLBACK_SIZE;
-                if (app.scrollback[sb_idx]) cell = app.scrollback[sb_idx][c];
-                else { memset(&cell, 0, sizeof(cell)); cell.chars[0] = ' '; }
-            } else {
-                vterm_screen_get_cell(app.vtscreen, (VTermPos){target_row, c}, &cell);
-            }
-            char utf8[16] = {0};
-            int w = get_cell_str(&cell, utf8);
-            if (line_len + w < (int)sizeof(line_chars) - 1) {
-                memcpy(line_chars + line_len, utf8, w);
-                line_len += w;
-            }
-        }
-        line_chars[line_len] = '\0';
-        if (has_uppercase ? strstr(line_chars, app.search_query) : my_strcasestr(line_chars, app.search_query)) {
-            temp_matches[count++] = (SearchMatch){.row = r, .col = 0, .len = app.cols};
-        }
-    }
-    if (count > 0) {
-        app.search_matches = malloc(sizeof(SearchMatch) * count);
-        if (app.search_matches) {
-            memcpy(app.search_matches, temp_matches, sizeof(SearchMatch) * count);
-            app.search_matches_count = count;
-            app.search_current_match = count - 1;
-            int screen_row = app.search_matches[app.search_current_match].row - app.scrollback_count;
-            if (screen_row < 0) {
-                app.scrollback_offset = -screen_row;
-                if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
-            } else if (screen_row >= app.rows) {
-                int shift = screen_row - (app.rows - 1);
-                if (shift < 1) shift = 1;
-                app.scrollback_offset += shift;
-                if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
-            } else {
-                app.scrollback_offset = 0;
-            }
-        }
-    }
-    free(temp_matches);
-    app.needs_render = 1;
-}
-
 static void copy_selection_to_clipboard(void) {
 }
 
@@ -760,19 +756,21 @@ static void render(void) {
     double default_fg_r = ((app.fg_color >> 16) & 0xFF) / 255.0;
     double default_fg_g = ((app.fg_color >> 8) & 0xFF) / 255.0;
     double default_fg_b = (app.fg_color & 0xFF) / 255.0;
-    double panel_height = (double)(app.font_height * 2);
+
+    VTermScreenCell *sb_row = malloc(sizeof(VTermScreenCell) * app.cols);
 
     for (int row = 0; row < app.rows; row++) {
         int target_row = row - app.scrollback_offset;
-        int virtual_row = app.scrollback_count + target_row;
-        int sb_idx = (target_row < 0) ? (app.scrollback_head + target_row + SCROLLBACK_SIZE) % SCROLLBACK_SIZE : 0;
-        const VTermScreenCell *sb_row = (target_row < 0) ? app.scrollback[sb_idx] : NULL;
+        
+        if (target_row < 0) {
+            int sb_idx = app.scrollback_count + target_row;
+            get_scrollback_line(sb_idx, sb_row);
+        }
 
         for (int col = 0; col < app.cols; col++) {
             VTermScreenCell cell;
             if (target_row < 0) {
-                if (sb_row) cell = sb_row[col];
-                else { memset(&cell, 0, sizeof(cell)); cell.chars[0] = ' '; }
+                cell = sb_row[col];
             } else {
                 vterm_screen_get_cell(app.vtscreen, (VTermPos){target_row, col}, &cell);
             }
@@ -783,11 +781,9 @@ static void render(void) {
                             &cr, &cg, &cb, &cbg_r, &cbg_g, &cbg_b, &has_bg);
 
             int is_underline = (cell.attrs.underline != 0);
-            int is_current_match = 0;
-            int matched = is_cell_matched(virtual_row, col, &is_current_match);
             int has_char = (cell.chars[0] && cell.chars[0] != ' ');
 
-            if (!has_char && !has_bg && !is_underline && !matched) continue;
+            if (!has_char && !has_bg && !is_underline) continue;
 
             int cell_w = get_cell_width(&cell);
             double x = (double)(col * app.font_width);
@@ -795,12 +791,7 @@ static void render(void) {
             double fw = (double)(app.font_width * cell_w);
             double fh = (double)app.font_height;
 
-            if (matched) {
-                if (is_current_match) cairo_set_source_rgb(app.cr, 0.9, 0.5, 0.2);
-                else cairo_set_source_rgb(app.cr, 0.8, 0.8, 0.2);
-                cairo_rectangle(app.cr, x, y, fw, fh);
-                cairo_fill(app.cr);
-            } else if (has_bg) {
+            if (has_bg) {
                 cairo_set_source_rgb(app.cr, cbg_r, cbg_g, cbg_b);
                 cairo_rectangle(app.cr, x, y, fw, fh);
                 cairo_fill(app.cr);
@@ -809,17 +800,13 @@ static void render(void) {
             if (has_char) {
                 char utf8[16] = {0};
                 int len = get_cell_str(&cell, utf8);
-                if (matched) {
-                    cairo_set_source_rgb(app.cr, bg_r, bg_g, bg_b);
+                double e_bg_r = has_bg ? cbg_r : bg_r;
+                double e_bg_g = has_bg ? cbg_g : bg_g;
+                double e_bg_b = has_bg ? cbg_b : bg_b;
+                if (((cr - e_bg_r)*(cr - e_bg_r) + (cg - e_bg_g)*(cg - e_bg_g) + (cb - e_bg_b)*(cb - e_bg_b)) < 0.05) {
+                    cairo_set_source_rgb(app.cr, default_fg_r, default_fg_g, default_fg_b);
                 } else {
-                    double e_bg_r = has_bg ? cbg_r : bg_r;
-                    double e_bg_g = has_bg ? cbg_g : bg_g;
-                    double e_bg_b = has_bg ? cbg_b : bg_b;
-                    if (((cr - e_bg_r)*(cr - e_bg_r) + (cg - e_bg_g)*(cg - e_bg_g) + (cb - e_bg_b)*(cb - e_bg_b)) < 0.05) {
-                        cairo_set_source_rgb(app.cr, default_fg_r, default_fg_g, default_fg_b);
-                    } else {
-                        cairo_set_source_rgb(app.cr, cr, cg, cb);
-                    }
+                    cairo_set_source_rgb(app.cr, cr, cg, cb);
                 }
                 cairo_move_to(app.cr, x, y);
                 pango_layout_set_text(app.pango_layout, utf8, len);
@@ -837,8 +824,9 @@ static void render(void) {
             if (cell_w == 2) col++;
         }
     }
+    free(sb_row);
 
-    if (app.scrollback_offset == 0 && !app.search_active) {
+    if (app.scrollback_offset == 0) {
         VTermPos cursor_pos;
         vterm_state_get_cursorpos(vterm_obtain_state(app.vterm), &cursor_pos);
         VTermScreenCell cursor_cell;
@@ -871,42 +859,6 @@ static void render(void) {
     }
 
     cairo_restore(app.cr);
-
-    if (app.search_active && !app.is_altscreen) {
-        double panel_y = (double)app.height - panel_height - (double)app.padding_y;
-        cairo_save(app.cr);
-        cairo_set_source_rgb(app.cr, bg_r, bg_g, bg_b);
-        cairo_rectangle(app.cr, (double)app.padding_x, panel_y, (double)app.width - (2.0 * app.padding_x), panel_height);
-        cairo_fill(app.cr);
-        cairo_set_source_rgba(app.cr, 0.15, 0.15, 0.15, 0.95);
-        cairo_rectangle(app.cr, (double)app.padding_x, panel_y, (double)app.width - (2.0 * app.padding_x), panel_height);
-        cairo_fill(app.cr);
-
-        char panel_text[512];
-        if (app.search_matches_count > 0) {
-            snprintf(panel_text, sizeof(panel_text), "Search: %s [%d/%d]", app.search_query, app.search_current_match + 1, app.search_matches_count);
-        } else {
-            snprintf(panel_text, sizeof(panel_text), "Search: %s [No matches]", app.search_query);
-        }
-        cairo_set_source_rgb(app.cr, default_fg_r, default_fg_g, default_fg_b);
-        cairo_move_to(app.cr, (double)app.padding_x + 10.0, panel_y + 4.0);
-        pango_layout_set_text(app.pango_layout, panel_text, strlen(panel_text));
-        pango_cairo_show_layout(app.cr, app.pango_layout);
-
-        char query_part[512];
-        snprintf(query_part, sizeof(query_part), "Search: %s", app.search_query);
-        int query_width_px = 0;
-        PangoLayout *layout_q = pango_cairo_create_layout(app.cr);
-        pango_layout_set_font_description(layout_q, app.font_desc);
-        pango_layout_set_text(layout_q, query_part, strlen(query_part));
-        pango_layout_get_pixel_size(layout_q, &query_width_px, NULL);
-        g_object_unref(layout_q);
-
-        cairo_set_source_rgb(app.cr, app.palette[1][0], app.palette[1][1], app.palette[1][2]);
-        cairo_rectangle(app.cr, (double)app.padding_x + 10.0 + (double)query_width_px, panel_y + 4.0, 2.0, (double)app.font_height);
-        cairo_fill(app.cr);
-        cairo_restore(app.cr);
-    }
 
     if (!app.is_altscreen && app.scrollback_count > 0) {
         double content_height = (double)(app.rows * app.font_height);
@@ -968,28 +920,20 @@ static int term_settermprop(VTermProp prop, VTermValue *val, void *user) {
 }
 
 static int term_sb_pushline(int cols, const VTermScreenCell *cells, void *user) {
-    if (app.scrollback[app.scrollback_head] == NULL) {
-        app.scrollback[app.scrollback_head] = malloc(sizeof(VTermScreenCell) * cols);
-    } else {
-        app.scrollback[app.scrollback_head] = realloc(app.scrollback[app.scrollback_head], sizeof(VTermScreenCell) * cols);
+    if (app.scrollback_fd >= 0) {
+        lseek(app.scrollback_fd, 0, SEEK_END);
+        write(app.scrollback_fd, cells, cols * sizeof(VTermScreenCell));
+        app.scrollback_count++;
     }
-    if (app.scrollback[app.scrollback_head]) {
-        memcpy(app.scrollback[app.scrollback_head], cells, sizeof(VTermScreenCell) * cols);
-    }
-    app.scrollback_head = (app.scrollback_head + 1) % SCROLLBACK_SIZE;
-    if (app.scrollback_count < SCROLLBACK_SIZE) app.scrollback_count++;
     return 1;
 }
 
 static int term_sb_popline(int cols, VTermScreenCell *cells, void *user) {
-    if (app.scrollback_count <= 0) return 0;
-    app.scrollback_head = (app.scrollback_head - 1 + SCROLLBACK_SIZE) % SCROLLBACK_SIZE;
+    if (app.scrollback_count <= 0 || app.scrollback_fd < 0) return 0;
     app.scrollback_count--;
-    if (app.scrollback[app.scrollback_head]) {
-        memcpy(cells, app.scrollback[app.scrollback_head], sizeof(VTermScreenCell) * cols);
-        return 1;
-    }
-    return 0;
+    off_t offset = (off_t)app.scrollback_count * (cols * sizeof(VTermScreenCell));
+    pread(app.scrollback_fd, cells, cols * sizeof(VTermScreenCell), offset);
+    return 1;
 }
 
 static void term_output(const char *s, size_t len, void *user) {
@@ -1012,20 +956,6 @@ static void resize_pty(void) {
     ws.ws_xpixel = app.width - app.padding_x - get_padding_right();
     ws.ws_ypixel = app.height - (app.padding_y * 2);
     ioctl(app.pty_master, TIOCSWINSZ, &ws);
-}
-
-static void update_terminal_size_for_search(void) {
-    int calc_rows = (app.height - (app.padding_y * 2)) / (app.font_height > 0 ? app.font_height : 16);
-    int new_rows = calc_rows < MIN_VTERM_ROWS ? MIN_VTERM_ROWS : calc_rows;
-    if (app.search_active && !app.is_altscreen) {
-        new_rows -= 2;
-        if (new_rows < 1) new_rows = 1;
-    }
-    if (new_rows != app.rows) {
-        app.rows = new_rows;
-        if (app.vterm) vterm_set_size(app.vterm, app.rows, app.cols);
-        resize_pty();
-    }
 }
 
 static void send_mouse_report(int button, int release, int col, int row) {
@@ -1051,10 +981,6 @@ static void change_font_size(int delta) {
     int calc_rows = (app.height - (app.padding_y * 2)) / (app.font_height > 0 ? app.font_height : 16);
     app.cols = calc_cols < MIN_VTERM_COLS ? MIN_VTERM_COLS : calc_cols;
     app.rows = calc_rows < MIN_VTERM_ROWS ? MIN_VTERM_ROWS : calc_rows;
-    if (app.search_active && !app.is_altscreen) {
-        app.rows -= 2;
-        if (app.rows < 1) app.rows = 1;
-    }
     if (app.vterm) vterm_set_size(app.vterm, app.rows, app.cols);
     resize_pty();
     render();
@@ -1084,10 +1010,6 @@ static void xdg_toplevel_handle_configure(void *data, struct xdg_toplevel *tople
     int calc_rows = (app.height - (app.padding_y * 2)) / (app.font_height > 0 ? app.font_height : 16);
     int new_cols = calc_cols < MIN_VTERM_COLS ? MIN_VTERM_COLS : calc_cols;
     int new_rows = calc_rows < MIN_VTERM_ROWS ? MIN_VTERM_ROWS : calc_rows;
-    if (app.search_active && !app.is_altscreen) {
-        new_rows -= 2;
-        if (new_rows < 1) new_rows = 1;
-    }
     if (new_cols != app.cols || new_rows != app.rows) {
         app.cols = new_cols;
         app.rows = new_rows;
@@ -1295,6 +1217,16 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
         if (sym == XKB_KEY_Shift_L || sym == XKB_KEY_Shift_R || sym == XKB_KEY_Control_L || sym == XKB_KEY_Control_R ||
             sym == XKB_KEY_Alt_L || sym == XKB_KEY_Alt_R || sym == XKB_KEY_Super_L || sym == XKB_KEY_Super_R) return;
 
+        if (alt && !ctrl && !shift && (sym == XKB_KEY_v || sym == XKB_KEY_V)) {
+            if (!app.is_altscreen && app.scrollback_offset == 0) {
+                pid_t fg_pgrp = tcgetpgrp(app.pty_master);
+                if (fg_pgrp <= 0 || fg_pgrp == app.pid || fg_pgrp == tcgetpgrp(STDIN_FILENO)) {
+                    open_scrollback_in_vim();
+                    return;
+                }
+            }
+        }
+
         if (ctrl && shift && (sym == XKB_KEY_c || sym == XKB_KEY_C)) { copy_selection_to_clipboard(); return; }
         if (ctrl && shift && (sym == XKB_KEY_v || sym == XKB_KEY_V)) { paste_from_clipboard(); return; }
 
@@ -1335,76 +1267,6 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             }
         }
 
-        if (app.search_active && !app.is_altscreen) {
-            if (sym == XKB_KEY_Escape) {
-                app.search_active = 0;
-                app.search_query[0] = '\0';
-                app.search_query_len = 0;
-                free(app.search_matches);
-                app.search_matches = NULL;
-                app.search_matches_count = 0;
-                update_terminal_size_for_search();
-                app.needs_render = 1;
-                return;
-            } else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
-                if (app.search_matches_count > 0) {
-                    if (shift) {
-                        app.search_current_match--;
-                        if (app.search_current_match < 0) app.search_current_match = app.search_matches_count - 1;
-                    } else {
-                        app.search_current_match++;
-                        if (app.search_current_match >= app.search_matches_count) app.search_current_match = 0;
-                    }
-                    int screen_row = app.search_matches[app.search_current_match].row - app.scrollback_count;
-                    if (screen_row < 0) {
-                        app.scrollback_offset = -screen_row;
-                        if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
-                    } else if (screen_row >= app.rows) {
-                        int shift_val = screen_row - (app.rows - 1);
-                        if (shift_val < 1) shift_val = 1;
-                        app.scrollback_offset += shift_val;
-                        if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
-                    } else {
-                        app.scrollback_offset = 0;
-                    }
-                    app.needs_render = 1;
-                }
-                return;
-            } else if ((ctrl && (sym == XKB_KEY_w || sym == XKB_KEY_W || keycode == 22 || sym == 65288)) || keycode == 22 || sym == 65288 || sym == XKB_KEY_BackSpace) {
-                if (app.search_query_len > 0) {
-                    if (ctrl && (sym == XKB_KEY_w || sym == XKB_KEY_W || sym == 65288 || keycode == 22)) {
-                        while (app.search_query_len > 0 && app.search_query[app.search_query_len - 1] == ' ') app.search_query[--app.search_query_len] = '\0';
-                        while (app.search_query_len > 0 && app.search_query[app.search_query_len - 1] != ' ') app.search_query[--app.search_query_len] = '\0';
-                    } else {
-                        app.search_query[--app.search_query_len] = '\0';
-                    }
-                    update_search_matches();
-                }
-                app.held_keycode = keycode;
-                app.held_bytes_len = 0;
-                app.next_repeat_time_ms = get_time_ms() + (app.repeat_delay_ms > 0 ? app.repeat_delay_ms : 250);
-                app.is_repeating = 0;
-                return;
-            } else {
-                char buf[32] = {0};
-                int len = app.xkb_state ? xkb_state_key_get_utf8(app.xkb_state, keycode, buf, sizeof(buf)) : 0;
-                if (len > 0 && buf[0] >= 32 && buf[0] < 127 && !ctrl) {
-                    if (app.search_query_len + len < (int)sizeof(app.search_query) - 1) {
-                        memcpy(app.search_query + app.search_query_len, buf, len);
-                        app.search_query_len += len;
-                        app.search_query[app.search_query_len] = '\0';
-                        update_search_matches();
-                    }
-                    app.held_keycode = keycode;
-                    app.held_bytes_len = len;
-                    memcpy(app.held_bytes, buf, len);
-                    app.next_repeat_time_ms = get_time_ms() + (app.repeat_delay_ms > 0 ? app.repeat_delay_ms : 250);
-                    app.is_repeating = 0;
-                }
-                return;
-            }
-        }
-
         if ((keycode == 36 || sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) && shift && !app.is_altscreen) {
             write(app.pty_master, "\\\n", 2);
             app.scrollback_offset = 0;
@@ -1414,15 +1276,6 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             memcpy(app.held_bytes, "\\\n", 2);
             app.next_repeat_time_ms = get_time_ms() + (app.repeat_delay_ms > 0 ? app.repeat_delay_ms : 250);
             app.is_repeating = 0;
-            return;
-        }
-
-        if (alt && (sym == XKB_KEY_slash || sym == XKB_KEY_question) && !app.is_altscreen) {
-            app.search_active = 1;
-            app.search_query[0] = '\0';
-            app.search_query_len = 0;
-            update_terminal_size_for_search();
-            update_search_matches();
             return;
         }
 
@@ -1580,6 +1433,12 @@ int main(int argc, char *argv[]) {
     setlocale(LC_ALL, "");
     load_config();
 
+    snprintf(app.scrollback_path, sizeof(app.scrollback_path), "/tmp/l-term-scrollback-XXXXXX");
+    app.scrollback_fd = mkstemp(app.scrollback_path);
+    if (app.scrollback_fd >= 0) {
+        unlink(app.scrollback_path);
+    }
+
     app.inotify_fd = inotify_init1(IN_NONBLOCK);
     if (app.inotify_fd >= 0) {
         char path[1024];
@@ -1595,6 +1454,7 @@ int main(int argc, char *argv[]) {
     app.display = wl_display_connect(NULL);
     if (!app.display) {
         fprintf(stderr, "Error: failed to connect to Wayland compositor\n");
+        if (app.scrollback_fd >= 0) close(app.scrollback_fd);
         return 1;
     }
 
@@ -1605,6 +1465,7 @@ int main(int argc, char *argv[]) {
 
     if (!app.compositor || !app.shm || !app.xdg_wm_base) {
         fprintf(stderr, "Error: required Wayland interfaces not found\n");
+        if (app.scrollback_fd >= 0) close(app.scrollback_fd);
         return 1;
     }
 
@@ -1682,55 +1543,7 @@ int main(int argc, char *argv[]) {
         if (app.held_keycode != 0) {
             long long now = get_time_ms();
             if (now >= app.next_repeat_time_ms) {
-                if (app.search_active && !app.is_altscreen) {
-                    int ctrl = app.xkb_state ? xkb_state_mod_name_is_active(app.xkb_state, XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) : 0;
-                    xkb_keysym_t sym = app.xkb_state ? xkb_state_key_get_one_sym(app.xkb_state, app.held_keycode) : XKB_KEY_NoSymbol;
-
-                    if ((ctrl && (sym == XKB_KEY_w || sym == XKB_KEY_W)) || app.held_keycode == 22 || sym == 65288 || sym == XKB_KEY_BackSpace) {
-                        if (app.search_query_len > 0) {
-                            if (ctrl && (sym == XKB_KEY_w || sym == XKB_KEY_W || sym == 65288 || app.held_keycode == 22)) {
-                                while (app.search_query_len > 0 && app.search_query[app.search_query_len - 1] == ' ') app.search_query[--app.search_query_len] = '\0';
-                                while (app.search_query_len > 0 && app.search_query[app.search_query_len - 1] != ' ') app.search_query[--app.search_query_len] = '\0';
-                            } else {
-                                app.search_query[--app.search_query_len] = '\0';
-                            }
-                            update_search_matches();
-                        }
-                    } else if (sym == XKB_KEY_Return || sym == XKB_KEY_KP_Enter) {
-                        if (app.search_matches_count > 0) {
-                            int shift = app.xkb_state ? xkb_state_mod_name_is_active(app.xkb_state, XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) : 0;
-                            if (shift) {
-                                app.search_current_match--;
-                                if (app.search_current_match < 0) app.search_current_match = app.search_matches_count - 1;
-                            } else {
-                                app.search_current_match++;
-                                if (app.search_current_match >= app.search_matches_count) app.search_current_match = 0;
-                            }
-                            int screen_row = app.search_matches[app.search_current_match].row - app.scrollback_count;
-                            if (screen_row < 0) {
-                                app.scrollback_offset = -screen_row;
-                                if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
-                            } else if (screen_row >= app.rows) {
-                                int shift_val = screen_row - (app.rows - 1);
-                                if (shift_val < 1) shift_val = 1;
-                                app.scrollback_offset += shift_val;
-                                if (app.scrollback_offset > app.scrollback_count) app.scrollback_offset = app.scrollback_count;
-                            } else {
-                                app.scrollback_offset = 0;
-                            }
-                            app.needs_render = 1;
-                        }
-                    } else if (app.held_bytes_len > 0 && !ctrl) {
-                        if (app.search_query_len + app.held_bytes_len < (int)sizeof(app.search_query) - 1) {
-                            memcpy(app.search_query + app.search_query_len, app.held_bytes, app.held_bytes_len);
-                            app.search_query_len += app.held_bytes_len;
-                            app.search_query[app.search_query_len] = '\0';
-                            update_search_matches();
-                        }
-                    }
-                } else {
-                    write(app.pty_master, app.held_bytes, app.held_bytes_len);
-                }
+                write(app.pty_master, app.held_bytes, app.held_bytes_len);
                 app.next_repeat_time_ms = now + (1000 / (app.repeat_rate_hz > 0 ? app.repeat_rate_hz : 30));
             }
         }
@@ -1777,7 +1590,6 @@ int main(int argc, char *argv[]) {
                 if (strstr(buf, "\033[?1049h") || strstr(buf, "\033[?47h") || strstr(buf, "\033[?1047h")) {
                     app.is_altscreen = 1;
                     app.scrollback_offset = 0;
-                    app.search_active = 0;
                 }
                 if (strstr(buf, "\033[?1049l") || strstr(buf, "\033[?47l") || strstr(buf, "\033[?1047l")) {
                     app.is_altscreen = 0;
@@ -1785,7 +1597,6 @@ int main(int argc, char *argv[]) {
                 }
 
                 vterm_input_write(app.vterm, buf, n);
-                if (app.search_active) update_search_matches();
                 if (!app.frame_callback && app.configured) {
                     app.frame_callback = wl_surface_frame(app.surface);
                     wl_callback_add_listener(app.frame_callback, &frame_listener, NULL);
@@ -1801,6 +1612,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    if (app.scrollback_fd >= 0) close(app.scrollback_fd);
     vterm_free(app.vterm);
     wl_display_disconnect(app.display);
     return 0;

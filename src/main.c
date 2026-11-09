@@ -143,7 +143,6 @@ static void render(void);
 static void create_buffer(void);
 static void cleanup_buffer(void);
 static void resize_pty(void);
-static void copy_selection_to_clipboard(void);
 static void update_cursor_shape(uint32_t serial);
 static const struct wl_callback_listener frame_listener;
 static void clear_full_history(void);
@@ -446,7 +445,7 @@ static void load_config(void) {
         system("mkdir -p ~/.config/l");
         FILE *df = fopen(path, "w");
         if (df) {
-            fprintf(df, "{\n  \"font_family\": \"DepartureMono\",\n  \"font_size\": 12,\n  \"bg_color\": \"#282828\",\n  \"fg_color\": \"#d3c6aa\",\n  \"padding_x\": 6,\n  \"padding_y\": 6,\n  \"shell\": \"fish\",\n  \"binds\": [\n    { \"key\": \"c\", \"mods\": \"ctrl+shift\", \"action\": \"copy\" },\n    { \"key\": \"v\", \"mods\": \"ctrl+shift\", \"action\": \"paste\" },\n    { \"key\": \"equal\", \"mods\": \"ctrl\", \"action\": \"font_increase\" },\n    { \"key\": \"minus\", \"mods\": \"ctrl\", \"action\": \"font_decrease\" }\n  ]\n}\n");
+            fprintf(df, "{\n  \"font_family\": \"DepartureMono\",\n  \"font_size\": 12,\n  \"bg_color\": \"#282828\",\n  \"fg_color\": \"#d3c6aa\",\n  \"padding_x\": 6,\n  \"padding_y\": 6,\n  \"shell\": \"fish\",\n  \"binds\": [\n    { \"key\": \"v\", \"mods\": \"ctrl+shift\", \"action\": \"paste\" },\n    { \"key\": \"equal\", \"mods\": \"ctrl\", \"action\": \"font_increase\" },\n    { \"key\": \"minus\", \"mods\": \"ctrl\", \"action\": \"font_decrease\" }\n  ]\n}\n");
             fclose(df);
         }
         f = fopen(path, "r");
@@ -708,9 +707,6 @@ static inline void get_cell_colors(const VTermScreenCell *cell, double default_r
     *out_r = fg_r; *out_g = fg_g; *out_b = fg_b;
     *out_bg_r = cell_bg_r; *out_bg_g = cell_bg_g; *out_bg_b = cell_bg_b;
     *has_bg = custom_bg;
-}
-
-static void copy_selection_to_clipboard(void) {
 }
 
 static void update_cursor_shape(uint32_t serial) {
@@ -1231,7 +1227,6 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
             }
         }
 
-        if (ctrl && shift && (sym == XKB_KEY_c || sym == XKB_KEY_C)) { copy_selection_to_clipboard(); return; }
         if (ctrl && shift && (sym == XKB_KEY_v || sym == XKB_KEY_V)) { paste_from_clipboard(); return; }
 
         xkb_keysym_t check_sym = xkb_keysym_to_lower(sym);
@@ -1245,8 +1240,7 @@ static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial, ui
 
                 for (int a = 0; a < app.binds[i].actions_count; a++) {
                     const char *action = app.binds[i].actions[a];
-                    if (strcmp(action, "copy") == 0) copy_selection_to_clipboard();
-                    else if (strcmp(action, "paste") == 0) paste_from_clipboard();
+                    if (strcmp(action, "paste") == 0) paste_from_clipboard();
                     else if (strcmp(action, "font_increase") == 0) change_font_size(1);
                     else if (strcmp(action, "font_decrease") == 0) change_font_size(-1);
                     else if (strcasecmp(action, "Return") == 0 || strcasecmp(action, "Enter") == 0) write(app.pty_master, "\r", 1);

@@ -253,6 +253,7 @@ static int pango_x_to_col(int target_row, double mouse_x_rel) {
     if (target_row < 0 || target_row >= app.rows) return 0;
     double current_x = 0;
     VTermScreenCell *row_cells = malloc(sizeof(VTermScreenCell) * app.cols);
+    if (!row_cells) return 0;
     for (int c = 0; c < app.cols; c++) {
         VTermScreenCell cell;
         int virtual_target = target_row - app.scrollback_offset;
@@ -582,7 +583,7 @@ static void paste_from_clipboard(void) {
         int is_nvim_insert = (app.cursor_shape == 2);
         if (!is_nvim_insert) {
             write(app.pty_master, "i", 1);
-            usleep(30000);
+            usleep(15000);
         }
     }
 
@@ -639,7 +640,6 @@ static void create_buffer(void) {
     if (fd < 0) return;
     app.shm_data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (app.shm_data == MAP_FAILED) { close(fd); app.shm_data = NULL; return; }
-    memset(app.shm_data, 0, size);
     struct wl_shm_pool *pool = wl_shm_create_pool(app.shm, fd, size);
     app.buffer = wl_shm_pool_create_buffer(pool, 0, app.width, app.height, stride, WL_SHM_FORMAT_ARGB8888);
     wl_shm_pool_destroy(pool);
@@ -758,6 +758,10 @@ static void render(void) {
     double default_fg_b = (app.fg_color & 0xFF) / 255.0;
 
     VTermScreenCell *sb_row = malloc(sizeof(VTermScreenCell) * app.cols);
+    if (!sb_row) {
+        cairo_restore(app.cr);
+        return;
+    }
 
     for (int row = 0; row < app.rows; row++) {
         int target_row = row - app.scrollback_offset;
@@ -1582,7 +1586,7 @@ int main(int argc, char *argv[]) {
         }
 
         if (FD_ISSET(app.pty_master, &fds)) {
-            char buf[8192];
+            char buf[16384];
             int n = read(app.pty_master, buf, sizeof(buf));
             if (n > 0) {
                 if (strstr(buf, "\033[?1000h") || strstr(buf, "\033[?1002h") || strstr(buf, "\033[?1006h")) app.mouse_reporting = 1;
